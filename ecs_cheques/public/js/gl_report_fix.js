@@ -12,7 +12,8 @@
 // This script is loaded on every query-report page (via `page_js` in
 // hooks.py).  It waits until the "General Ledger" report definition is
 // available and then patches its `formatter` to use the per-row
-// `account_currency` for the transaction-currency columns.
+// `account_currency` for the transaction-currency columns and the per-row
+// `payment_currency` for the new payment-currency columns.
 
 (function () {
     "use strict";
@@ -23,10 +24,15 @@
         "credit_in_account_currency",
         "balance_in_account_currency"
     ];
+    var PAYMENT_CURRENCY_COLUMNS = [
+        "debit_in_payment_currency",
+        "credit_in_payment_currency"
+    ];
 
     /**
      * Wrap the report's `formatter` so that transaction-currency columns pick
-     * up the per-row `account_currency` rather than any fixed options value.
+     * up the per-row `account_currency` rather than any fixed options value,
+     * and payment-currency columns use the per-row `payment_currency`.
      */
     function patch_gl_formatter(report_def) {
         if (report_def._ecs_gl_patched) return;
@@ -35,17 +41,24 @@
         var original_formatter = report_def.formatter;
 
         report_def.formatter = function (value, row, column, data, default_formatter) {
-            // For transaction-currency columns, temporarily override the
-            // column's options with the row's own account_currency so the
-            // currency formatter renders the correct symbol per row.
+            var col_id = column && (column.id || column.fieldname);
+
+            // For transaction-currency columns, override options with per-row account_currency.
             if (
-                column &&
                 data &&
                 data.account_currency &&
-                TX_CURRENCY_COLUMNS.indexOf(column.id || column.fieldname) !== -1
+                TX_CURRENCY_COLUMNS.indexOf(col_id) !== -1
             ) {
-                // Clone column to avoid mutating the shared definition object
                 column = Object.assign({}, column, { options: data.account_currency });
+            }
+
+            // For payment-currency columns, override options with per-row payment_currency.
+            if (
+                data &&
+                data.payment_currency &&
+                PAYMENT_CURRENCY_COLUMNS.indexOf(col_id) !== -1
+            ) {
+                column = Object.assign({}, column, { options: data.payment_currency });
             }
 
             if (original_formatter) {
