@@ -23,6 +23,7 @@ the ``boot_session`` hook in hooks.py.
 """
 
 import frappe
+from frappe.utils import flt, getdate, nowdate
 
 
 # Column definitions for the extra payment-currency columns injected into the
@@ -40,6 +41,20 @@ _PAYMENT_CURRENCY_COLUMNS = [
         "label": "Credit (Payment Currency)",
         "fieldtype": "Currency",
         "options": "payment_currency",
+        "width": 130,
+    },
+    {
+        "fieldname": "debit_in_party_currency",
+        "label": "Debit (Party Currency)",
+        "fieldtype": "Currency",
+        "options": "party_currency",
+        "width": 130,
+    },
+    {
+        "fieldname": "credit_in_party_currency",
+        "label": "Credit (Party Currency)",
+        "fieldtype": "Currency",
+        "options": "party_currency",
         "width": 130,
     },
 ]
@@ -113,17 +128,66 @@ def _inject_payment_currency_columns(columns):
 	return list(columns) + extra
 
 
+def _fetch_exchange_rate(from_currency, to_currency, posting_date=None):
+	"""Fetch the exchange rate from *from_currency* to *to_currency* using the
+	Currency Exchange DocType.
+
+	Returns 1.0 when currencies are equal.  Tries the direct pair first, then
+	the inverse pair.  Returns None when no matching record is found.
+	"""
+	if not from_currency or not to_currency:
+		return None
+	if from_currency == to_currency:
+		return 1.0
+
+	date_filter = getdate(posting_date) if posting_date else getdate(nowdate())
+
+	# Direct pair
+	rate = frappe.db.get_value(
+		"Currency Exchange",
+		{"from_currency": from_currency, "to_currency": to_currency,
+		 "date": ["<=", date_filter]},
+		"exchange_rate",
+		order_by="date desc",
+	)
+	if rate:
+		return flt(rate)
+
+	# Inverse pair
+	rate = frappe.db.get_value(
+		"Currency Exchange",
+		{"from_currency": to_currency, "to_currency": from_currency,
+		 "date": ["<=", date_filter]},
+		"exchange_rate",
+		order_by="date desc",
+	)
+	if rate and flt(rate) > 0:
+		return flt(1.0 / flt(rate), 9)
+
+	return None
+
+
 def _add_payment_currency_data(data):
-	"""Populate ``debit_in_payment_currency``, ``credit_in_payment_currency``,
-	and ``payment_currency`` for GL rows that originate from Payment Entries.
+	"""Populate payment-currency and party-currency columns for GL rows that
+	originate from Payment Entries.
 
 	For each Payment Entry referenced in the data, we fetch:
 	- ``paid_to_account_currency``  – the bank/wallet account currency (e.g. JOD)
 	- ``received_amount``           – the amount in that currency
+	- ``paid_from_account_currency`` – the party/source account currency (e.g. ILS)
+	- ``paid_amount``               – the amount on the party side
 
-	Both the party-account debit row and the bank-account credit row of the same
-	PE are then stamped with the JOD amounts so the report shows a consistent
-	payment-currency column on both sides.
+	The following fields are populated on every matching GL row:
+
+	* ``payment_currency``          – e.g. "JOD"
+	* ``debit_in_payment_currency`` – debit in JOD
+	* ``credit_in_payment_currency`` – credit in JOD
+	* ``party_currency``            – e.g. "ILS"
+	* ``debit_in_party_currency``   – debit in ILS
+	* ``credit_in_party_currency``  – credit in ILS
+
+	Exchange rates are cached per (from, to, date) key to avoid redundant DB
+	queries when many GL rows reference the same Payment Entry.
 	"""
 	if not data:
 		return
@@ -147,11 +211,27 @@ def _add_payment_currency_data(data):
 			"paid_from_account_currency", "paid_to_account_currency",
 			"paid_amount", "received_amount",
 			"source_exchange_rate", "target_exchange_rate",
+			"posting_date",
 		],
 	)
 
 	# Build map: pe_name → PE data
 	pe_map = {pe.name: pe for pe in pe_rows}
+
+	# Exchange-rate cache: (from_currency, to_currency, date_str) → rate
+	_rate_cache = {}
+
+	def _get_rate(from_currency, to_currency, posting_date=None):
+		"""Cached exchange-rate lookup."""
+		if not from_currency or not to_currency:
+			return None
+		if from_currency == to_currency:
+			return 1.0
+		date_str = str(posting_date) if posting_date else ""
+		key = (from_currency, to_currency, date_str)
+		if key not in _rate_cache:
+			_rate_cache[key] = _fetch_exchange_rate(from_currency, to_currency, posting_date)
+		return _rate_cache[key]
 
 	for row in data:
 		if not isinstance(row, dict):
@@ -164,45 +244,71 @@ def _add_payment_currency_data(data):
 
 		pe = pe_map[pe_name]
 		account = row.get("account")
+		posting_date = pe.get("posting_date")
 
-		# Determine the "payment currency" – the currency of the MOP/bank account.
-		# For Receive: bank account is paid_to (e.g. JOD wallet).
-		# For Pay:     bank account is paid_from (e.g. JOD bank).
-		# We use paid_to_account_currency as the canonical payment currency since
-		# for Receive it is the cheque/bank currency, and for Pay we fall back to
-		# paid_from_account_currency.
-		payment_currency = (
-			pe.paid_to_account_currency
-			or pe.paid_from_account_currency
-			or ""
-		)
+		# Payment currency = MOP/bank account currency (paid_to for Receive; paid_from for Pay)
+		payment_currency = pe.paid_to_account_currency or pe.paid_from_account_currency or ""
+		# Party currency = the counterpart account currency
+		party_currency = pe.paid_from_account_currency or pe.paid_to_account_currency or ""
+		# If both sides have a value, paid_from is the party and paid_to is the bank (Receive)
+		if pe.paid_from_account_currency and pe.paid_to_account_currency:
+			if pe.paid_from_account_currency != pe.paid_to_account_currency:
+				payment_currency = pe.paid_to_account_currency   # bank side
+				party_currency = pe.paid_from_account_currency   # party side
+
 		row["payment_currency"] = payment_currency
+		row["party_currency"] = party_currency
 
-		# Determine which account is the "bank" side (paid_to for Receive / paid_from for Pay).
-		# The bank-side amount is received_amount (for Receive) in payment currency.
-		# For the party-side row we derive the payment-currency equivalent from the GL
-		# base amount using the target exchange rate.
-		debit_company = row.get("debit") or 0
-		credit_company = row.get("credit") or 0
+		debit_company = flt(row.get("debit") or 0)
+		credit_company = flt(row.get("credit") or 0)
 		base_company = debit_company or credit_company
 
-		target_rate = pe.target_exchange_rate or 1.0
-		if target_rate and target_rate != 0:
-			payment_amount = flt(base_company / target_rate, 9)
-		else:
-			payment_amount = flt(base_company, 9)
-
+		# ── Payment-currency amounts ────────────────────────────────────────
 		if account == pe.paid_to:
-			# Bank/wallet credit row – use received_amount directly.
-			row["debit_in_payment_currency"] = 0
-			row["credit_in_payment_currency"] = pe.received_amount or payment_amount
+			# Bank/wallet credit row: use received_amount directly (in payment currency)
+			pay_debit = 0.0
+			pay_credit = flt(pe.received_amount or 0)
+			if not pay_credit and base_company:
+				rate = flt(pe.target_exchange_rate)
+				pay_credit = flt(base_company / rate, 9) if rate and rate != 0 else flt(base_company, 9)
 		elif account == pe.paid_from:
-			# Party/bank debit row – derive from base company amount.
-			row["debit_in_payment_currency"] = payment_amount
-			row["credit_in_payment_currency"] = 0
+			# Party debit row: use paid_amount directly (in party/paid_from currency)
+			pay_debit = flt(pe.paid_amount or 0)
+			pay_credit = 0.0
+			if not pay_debit and base_company:
+				rate = flt(pe.source_exchange_rate)
+				pay_debit = flt(base_company / rate, 9) if rate and rate != 0 else flt(base_company, 9)
 		else:
-			row["debit_in_payment_currency"] = payment_amount if debit_company else 0
-			row["credit_in_payment_currency"] = payment_amount if credit_company else 0
+			# Other rows – derive from base company amount using target rate
+			rate = flt(pe.target_exchange_rate)
+			derived = flt(base_company / rate, 9) if rate and rate != 0 else flt(base_company, 9)
+			pay_debit = derived if debit_company else 0.0
+			pay_credit = derived if credit_company else 0.0
+
+		row["debit_in_payment_currency"] = pay_debit
+		row["credit_in_payment_currency"] = pay_credit
+
+		# ── Party-currency amounts ──────────────────────────────────────────
+		# Convert the payment-currency amounts → party currency using Currency Exchange.
+		if party_currency and payment_currency and party_currency != payment_currency:
+			rate_to_party = _get_rate(payment_currency, party_currency, posting_date)
+			if rate_to_party is None:
+				# Warn and fall back to zero so the column is visibly blank rather
+				# than showing a silently wrong value.
+				frappe.log_error(
+					f"ECS GL: No exchange rate found for {payment_currency} → {party_currency} "
+					f"on {posting_date}. Party currency columns left blank for {pe_name}.",
+					"ECS GL Missing Exchange Rate",
+				)
+				row["debit_in_party_currency"] = 0.0
+				row["credit_in_party_currency"] = 0.0
+			else:
+				row["debit_in_party_currency"] = flt(pay_debit * rate_to_party, 9)
+				row["credit_in_party_currency"] = flt(pay_credit * rate_to_party, 9)
+		else:
+			# Same currency or no conversion needed – use payment-currency values directly.
+			row["debit_in_party_currency"] = pay_debit
+			row["credit_in_party_currency"] = pay_credit
 
 
 def _fix_account_currency_per_row(data):
