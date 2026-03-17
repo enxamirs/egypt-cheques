@@ -2,33 +2,66 @@
 # For license information, please see license.txt
 
 """
-General Ledger report override.
+General Ledger report override – multi-currency audit layer.
 
 Fixes the "Add Columns in Transaction Currency" feature so that each GL row
 uses its own ``account_currency`` (sourced directly from the GL Entry / Account
 master) rather than a shared filter/presentation currency.
 
-Also adds two extra data columns when the transaction-currency option is enabled:
+For Payment Entries involving three currencies (e.g. Payment Currency = JOD,
+Party Currency = ILS, Company Currency = USD), adds a smart multi-currency
+audit layer with the following extra columns:
 
-* ``debit_in_payment_currency``  – Debit amount in the payment method (cheque)
-  currency (e.g. JOD when the MOP account is a JOD bank account).
-* ``credit_in_payment_currency`` – Credit amount in the same payment currency.
+Primary payment-currency columns (JOD shown on BOTH sides):
+  * ``source_debit_jod``   – Debit in payment currency for EVERY GL row of the PE.
+  * ``source_credit_jod``  – Credit in payment currency for EVERY GL row of the PE.
 
-These columns allow the report to show the "raw" cheque value on BOTH the
-party-account row (ILS debit) and the bank/wallet row (JOD credit) so that
-the user can see all three values: USD (company), JOD (payment), ILS (party).
+Party-currency columns:
+  * ``party_debit_ils``    – Debit in party account currency (e.g. ILS).
+  * ``party_credit_ils``   – Credit in party account currency.
 
-This module is monkey-patched onto the ERPNext GL report at app boot time via
-the ``boot_session`` hook in hooks.py.
+Cross-currency rate columns:
+  * ``jod_to_usd_rate``    – Payment currency → company currency rate.
+  * ``jod_to_ils_rate``    – Payment currency → party currency rate.
+
+Validation column:
+  * ``rate_mismatch_warning`` – Non-empty when the derived rate differs from
+                                the Currency Exchange master by more than 0.01%.
+
+Traceability columns:
+  * ``payment_entry_reference``    – Link to the Payment Entry.
+  * ``multiple_cheque_reference``  – Link to the originating Multiple Cheque Entry
+                                     (when the PE was created from one).
+
+Legacy backward-compatible columns (kept for existing integrations):
+  * ``debit_in_payment_currency``  – Debit in bank/MOP account currency.
+  * ``credit_in_payment_currency`` – Credit in bank/MOP account currency.
+  * ``debit_in_party_currency``    – Debit in party account currency (ILS equiv.).
+  * ``credit_in_party_currency``   – Credit in party account currency.
+
+Phase 3 – "Add Columns in Transaction Currency" override:
+  When this filter is enabled the standard ERPNext columns
+  (``debit_in_account_currency`` / ``credit_in_account_currency``) are
+  overridden to display the payment currency (JOD) for ALL GL rows of the PE,
+  ensuring a uniform currency view rather than mixing ILS and JOD per side.
+
+This module is monkey-patched onto the ERPNext General Ledger report at app
+boot time via the ``boot_session`` hook in hooks.py.
 """
 
 import frappe
 from frappe.utils import flt, getdate, nowdate
 
+# Tolerance for exchange-rate mismatch warnings (0.01 % of the reference rate).
+_RATE_MISMATCH_THRESHOLD = 0.0001
 
-# Column definitions for the extra payment-currency columns injected into the
-# GL report.  They are appended after the standard transaction-currency columns.
-_PAYMENT_CURRENCY_COLUMNS = [
+
+# ---------------------------------------------------------------------------
+# Column definitions injected into the GL report
+# ---------------------------------------------------------------------------
+
+# Legacy columns kept for backward compatibility.
+_LEGACY_PAYMENT_CURRENCY_COLUMNS = [
     {
         "fieldname": "debit_in_payment_currency",
         "label": "Debit (Payment Currency)",
@@ -58,6 +91,78 @@ _PAYMENT_CURRENCY_COLUMNS = [
         "width": 130,
     },
 ]
+
+# New Phase 1 columns: explicit multi-currency audit layer.
+_AUDIT_COLUMNS = [
+    # ── Primary payment-currency columns (JOD for BOTH sides) ────────────
+    {
+        "fieldname": "source_debit_jod",
+        "label": "Debit (Payment)",
+        "fieldtype": "Currency",
+        "options": "payment_currency",
+        "width": 130,
+    },
+    {
+        "fieldname": "source_credit_jod",
+        "label": "Credit (Payment)",
+        "fieldtype": "Currency",
+        "options": "payment_currency",
+        "width": 130,
+    },
+    # ── Party-currency columns ────────────────────────────────────────────
+    {
+        "fieldname": "party_debit_ils",
+        "label": "Debit (Party)",
+        "fieldtype": "Currency",
+        "options": "party_currency",
+        "width": 130,
+    },
+    {
+        "fieldname": "party_credit_ils",
+        "label": "Credit (Party)",
+        "fieldtype": "Currency",
+        "options": "party_currency",
+        "width": 130,
+    },
+    # ── Cross-currency rate columns ───────────────────────────────────────
+    {
+        "fieldname": "jod_to_usd_rate",
+        "label": "Rate (Payment→Company)",
+        "fieldtype": "Float",
+        "width": 150,
+    },
+    {
+        "fieldname": "jod_to_ils_rate",
+        "label": "Rate (Payment→Party)",
+        "fieldtype": "Float",
+        "width": 140,
+    },
+    # ── Validation column ─────────────────────────────────────────────────
+    {
+        "fieldname": "rate_mismatch_warning",
+        "label": "Rate Warning",
+        "fieldtype": "Data",
+        "width": 160,
+    },
+    # ── Traceability columns ──────────────────────────────────────────────
+    {
+        "fieldname": "payment_entry_reference",
+        "label": "Payment Entry",
+        "fieldtype": "Link",
+        "options": "Payment Entry",
+        "width": 160,
+    },
+    {
+        "fieldname": "multiple_cheque_reference",
+        "label": "Multiple Cheque Entry",
+        "fieldtype": "Link",
+        "options": "Multiple Cheque Entry",
+        "width": 190,
+    },
+]
+
+# All payment-currency columns combined (legacy first, then new).
+_PAYMENT_CURRENCY_COLUMNS = _LEGACY_PAYMENT_CURRENCY_COLUMNS + _AUDIT_COLUMNS
 
 
 def patch_general_ledger_report(*args, **kwargs):
@@ -167,27 +272,67 @@ def _fetch_exchange_rate(from_currency, to_currency, posting_date=None):
 	return None
 
 
+def _fetch_multiple_cheque_references(pe_names):
+	"""Return a mapping of pe_name → Multiple Cheque Entry name.
+
+	Looks up the Cheque Table Receive child rows whose ``payment_entry``
+	field matches one of the supplied PE names.  The ``parent`` of each
+	matching row is the Multiple Cheque Entry that originated the PE.
+
+	Returns a dict: {pe_name: mce_name}.  PEs that were not created from
+	a Multiple Cheque Entry are absent from the returned dict.
+	"""
+	if not pe_names:
+		return {}
+	rows = frappe.get_all(
+		"Cheque Table Receive",
+		filters={
+			"payment_entry": ["in", list(pe_names)],
+			"parenttype": "Multiple Cheque Entry",
+		},
+		fields=["payment_entry", "parent"],
+	)
+	return {r.payment_entry: r.parent for r in rows if r.payment_entry and r.parent}
+
+
 def _add_payment_currency_data(data):
-	"""Populate payment-currency and party-currency columns for GL rows that
-	originate from Payment Entries.
+	"""Populate multi-currency audit columns for GL rows from Payment Entries.
 
-	For each Payment Entry referenced in the data, we fetch:
-	- ``paid_to_account_currency``  – the bank/wallet account currency (e.g. JOD)
-	- ``received_amount``           – the amount in that currency
-	- ``paid_from_account_currency`` – the party/source account currency (e.g. ILS)
-	- ``paid_amount``               – the amount on the party side
+	For each Payment Entry referenced in *data* the following fields are set
+	on every matching GL row:
 
-	The following fields are populated on every matching GL row:
+	Currency metadata
+	  ``payment_currency``          – bank / MOP account currency (e.g. JOD)
+	  ``party_currency``            – party account currency (e.g. ILS)
 
-	* ``payment_currency``          – e.g. "JOD"
-	* ``debit_in_payment_currency`` – debit in JOD
-	* ``credit_in_payment_currency`` – credit in JOD
-	* ``party_currency``            – e.g. "ILS"
-	* ``debit_in_party_currency``   – debit in ILS
-	* ``credit_in_party_currency``  – credit in ILS
+	Legacy backward-compatible columns
+	  ``debit_in_payment_currency`` / ``credit_in_payment_currency``
+	  ``debit_in_party_currency``   / ``credit_in_party_currency``
+
+	Phase 1 – primary payment-currency columns (JOD shown on BOTH GL sides)
+	  ``source_debit_jod``          – debit expressed in payment currency
+	  ``source_credit_jod``         – credit expressed in payment currency
+
+	Phase 1 – party-currency columns
+	  ``party_debit_ils``           – debit expressed in party currency
+	  ``party_credit_ils``          – credit expressed in party currency
+
+	Phase 4 – cross-currency rate columns
+	  ``jod_to_usd_rate``           – payment currency → company currency rate
+	  ``jod_to_ils_rate``           – payment currency → party currency rate
+
+	Phase 4/5 – validation
+	  ``rate_mismatch_warning``     – non-empty string when the derived rate
+	                                  differs from the Currency Exchange master
+	                                  by more than _RATE_MISMATCH_THRESHOLD.
+
+	Phase 7 – traceability
+	  ``payment_entry_reference``   – name of the Payment Entry
+	  ``multiple_cheque_reference`` – name of the originating Multiple Cheque
+	                                  Entry (empty when not applicable)
 
 	Exchange rates are cached per (from, to, date) key to avoid redundant DB
-	queries when many GL rows reference the same Payment Entry.
+	queries when many GL rows reference the same Payment Entry (Phase 6).
 	"""
 	if not data:
 		return
@@ -218,11 +363,14 @@ def _add_payment_currency_data(data):
 	# Build map: pe_name → PE data
 	pe_map = {pe.name: pe for pe in pe_rows}
 
-	# Exchange-rate cache: (from_currency, to_currency, date_str) → rate
+	# Phase 7: pre-fetch Multiple Cheque Entry references (one batch query).
+	mce_map = _fetch_multiple_cheque_references(pe_names)
+
+	# Phase 6: exchange-rate cache – (from_currency, to_currency, date_str) → rate
 	_rate_cache = {}
 
 	def _get_rate(from_currency, to_currency, posting_date=None):
-		"""Cached exchange-rate lookup."""
+		"""Cached exchange-rate lookup (Phase 6 performance optimisation)."""
 		if not from_currency or not to_currency:
 			return None
 		if from_currency == to_currency:
@@ -246,69 +394,184 @@ def _add_payment_currency_data(data):
 		account = row.get("account")
 		posting_date = pe.get("posting_date")
 
-		# Payment currency = MOP/bank account currency (paid_to for Receive; paid_from for Pay)
+		# ── Phase 2 Step 2: identify currency roles ─────────────────────────
+		# Payment currency = MOP/bank account currency (paid_to for Receive)
 		payment_currency = pe.paid_to_account_currency or pe.paid_from_account_currency or ""
-		# Party currency = the counterpart account currency
+		# Party currency = counterpart account currency
 		party_currency = pe.paid_from_account_currency or pe.paid_to_account_currency or ""
-		# If both sides have a value, paid_from is the party and paid_to is the bank (Receive)
+		# When both differ: paid_from = party side, paid_to = bank/payment side
 		if pe.paid_from_account_currency and pe.paid_to_account_currency:
 			if pe.paid_from_account_currency != pe.paid_to_account_currency:
-				payment_currency = pe.paid_to_account_currency   # bank side
-				party_currency = pe.paid_from_account_currency   # party side
+				payment_currency = pe.paid_to_account_currency  # bank / MOP
+				party_currency = pe.paid_from_account_currency  # party account
 
 		row["payment_currency"] = payment_currency
 		row["party_currency"] = party_currency
+
+		# Phase 7: traceability columns
+		row["payment_entry_reference"] = pe_name
+		row["multiple_cheque_reference"] = mce_map.get(pe_name) or ""
 
 		debit_company = flt(row.get("debit") or 0)
 		credit_company = flt(row.get("credit") or 0)
 		base_company = debit_company or credit_company
 
-		# ── Payment-currency amounts ────────────────────────────────────────
+		# ── Phase 2 Step 4/5: determine canonical JOD amount ────────────────
+		# received_amount is always in paid_to_account_currency (= payment_currency
+		# = JOD for a Receive PE).  Use it as the source of truth for JOD.
+		jod_amount = flt(pe.received_amount or 0)
+		if not jod_amount:
+			# Fallback: derive from company-currency base using target rate.
+			target_rate = flt(pe.target_exchange_rate)
+			jod_amount = flt(base_company / target_rate, 9) if target_rate else flt(base_company, 9)
+
+		# ── Phase 2 Step 5: company-currency rate (JOD → USD) ───────────────
+		# target_exchange_rate = paid_to_currency → company_currency
+		target_rate = flt(pe.target_exchange_rate)
+		jod_to_usd = target_rate if target_rate else None
+		if jod_to_usd is None and jod_amount:
+			jod_to_usd = _get_rate(payment_currency, _company_currency_of_row(row), posting_date)
+
+		# ── Legacy payment-currency amounts (backward compat) ────────────────
 		if account == pe.paid_to:
-			# Bank/wallet credit row: use received_amount directly (in payment currency)
+			# Bank/wallet row: received_amount is directly in payment currency.
 			pay_debit = 0.0
 			pay_credit = flt(pe.received_amount or 0)
 			if not pay_credit and base_company:
-				rate = flt(pe.target_exchange_rate)
-				pay_credit = flt(base_company / rate, 9) if rate and rate != 0 else flt(base_company, 9)
+				pay_credit = (
+					flt(base_company / target_rate, 9) if target_rate else flt(base_company, 9)
+				)
 		elif account == pe.paid_from:
-			# Party debit row: use paid_amount directly (in party/paid_from currency)
+			# Party row (legacy): keep paid_amount (party currency) for this column.
 			pay_debit = flt(pe.paid_amount or 0)
 			pay_credit = 0.0
 			if not pay_debit and base_company:
-				rate = flt(pe.source_exchange_rate)
-				pay_debit = flt(base_company / rate, 9) if rate and rate != 0 else flt(base_company, 9)
+				source_rate = flt(pe.source_exchange_rate)
+				pay_debit = (
+					flt(base_company / source_rate, 9) if source_rate else flt(base_company, 9)
+				)
 		else:
-			# Other rows – derive from base company amount using target rate
-			rate = flt(pe.target_exchange_rate)
-			derived = flt(base_company / rate, 9) if rate and rate != 0 else flt(base_company, 9)
+			# Other rows – derive from company-currency amount.
+			derived = (
+				flt(base_company / target_rate, 9) if target_rate else flt(base_company, 9)
+			)
 			pay_debit = derived if debit_company else 0.0
 			pay_credit = derived if credit_company else 0.0
 
 		row["debit_in_payment_currency"] = pay_debit
 		row["credit_in_payment_currency"] = pay_credit
 
-		# ── Party-currency amounts ──────────────────────────────────────────
-		# Convert the payment-currency amounts → party currency using Currency Exchange.
-		if party_currency and payment_currency and party_currency != payment_currency:
-			rate_to_party = _get_rate(payment_currency, party_currency, posting_date)
-			if rate_to_party is None:
-				# Warn and fall back to zero so the column is visibly blank rather
-				# than showing a silently wrong value.
-				frappe.log_error(
-					f"ECS GL: No exchange rate found for {payment_currency} → {party_currency} "
-					f"on {posting_date}. Party currency columns left blank for {pe_name}.",
-					"ECS GL Missing Exchange Rate",
-				)
-				row["debit_in_party_currency"] = 0.0
-				row["credit_in_party_currency"] = 0.0
-			else:
-				row["debit_in_party_currency"] = flt(pay_debit * rate_to_party, 9)
-				row["credit_in_party_currency"] = flt(pay_credit * rate_to_party, 9)
+		# ── Phase 1: source JOD columns – payment currency for BOTH sides ────
+		# Per the requirement: source_debit/credit_jod must use the SAME JOD
+		# amount regardless of whether the row is the bank or party side.
+		if debit_company:
+			row["source_debit_jod"] = jod_amount
+			row["source_credit_jod"] = 0.0
+		elif credit_company:
+			row["source_debit_jod"] = 0.0
+			row["source_credit_jod"] = jod_amount
 		else:
-			# Same currency or no conversion needed – use payment-currency values directly.
+			row["source_debit_jod"] = 0.0
+			row["source_credit_jod"] = 0.0
+
+		# ── Phase 2 Step 5: compute party-currency (ILS) amounts ─────────────
+		rate_jod_to_ils = None
+		if party_currency and payment_currency and party_currency != payment_currency:
+			rate_jod_to_ils = _get_rate(payment_currency, party_currency, posting_date)
+
+		if rate_jod_to_ils is None and party_currency == payment_currency:
+			rate_jod_to_ils = 1.0
+
+		if rate_jod_to_ils is None:
+			# Missing rate – log and leave party columns blank (Phase 5 guard).
+			frappe.log_error(
+				f"ECS GL: No exchange rate found for {payment_currency} → {party_currency} "
+				f"on {posting_date}. Party currency columns left blank for {pe_name}.",
+				"ECS GL Missing Exchange Rate",
+			)
+			ils_debit = 0.0
+			ils_credit = 0.0
+		else:
+			ils_debit = flt(row["source_debit_jod"] * rate_jod_to_ils, 9)
+			ils_credit = flt(row["source_credit_jod"] * rate_jod_to_ils, 9)
+
+		# Legacy party-currency columns.
+		if party_currency and payment_currency and party_currency != payment_currency:
+			row["debit_in_party_currency"] = flt(pay_debit * (rate_jod_to_ils or 0), 9)
+			row["credit_in_party_currency"] = flt(pay_credit * (rate_jod_to_ils or 0), 9)
+		else:
 			row["debit_in_party_currency"] = pay_debit
 			row["credit_in_party_currency"] = pay_credit
+
+		# Phase 1: explicit party-currency columns (ILS for both sides).
+		row["party_debit_ils"] = ils_debit
+		row["party_credit_ils"] = ils_credit
+
+		# ── Phase 4: cross-currency rate columns ─────────────────────────────
+		row["jod_to_usd_rate"] = flt(jod_to_usd, 9) if jod_to_usd else 0.0
+		row["jod_to_ils_rate"] = flt(rate_jod_to_ils, 9) if rate_jod_to_ils else 0.0
+
+		# ── Phase 4/5: cross-currency rate validation ─────────────────────────
+		warning = _validate_exchange_rate(
+			payment_currency, party_currency, rate_jod_to_ils, posting_date, _rate_cache
+		)
+		row["rate_mismatch_warning"] = warning or ""
+
+
+def _company_currency_of_row(row):
+	"""Return the company currency for a GL data row.
+
+	Reads the company from the ``company`` column when available and looks up
+	the default currency.  Returns ``""`` when the company is not known so
+	the caller can handle it gracefully.
+	"""
+	company = row.get("company") if isinstance(row, dict) else None
+	if company:
+		return frappe.db.get_value("Company", company, "default_currency") or ""
+	return ""
+
+
+def _validate_exchange_rate(payment_currency, party_currency, derived_rate, posting_date, rate_cache):
+	"""Phase 5: validate the derived exchange rate against the Currency Exchange master.
+
+	Returns a non-empty warning string when the absolute relative difference
+	exceeds ``_RATE_MISMATCH_THRESHOLD``, or ``""`` when everything is
+	consistent.
+
+	Guards against:
+	  * Missing currencies (returns ``""`` – no comparison possible)
+	  * Zero/None derived rate (returns explicit warning)
+	  * Division by zero (returns explicit warning)
+	"""
+	if not payment_currency or not party_currency or payment_currency == party_currency:
+		return ""
+
+	# Phase 5: guard against zero/missing derived rate.
+	if not derived_rate:
+		return f"MISSING_RATE: {payment_currency}→{party_currency}"
+
+	date_str = str(posting_date) if posting_date else ""
+	cache_key = (payment_currency, party_currency, date_str)
+	if cache_key not in rate_cache:
+		rate_cache[cache_key] = _fetch_exchange_rate(payment_currency, party_currency, posting_date)
+	reference_rate = rate_cache[cache_key]
+
+	if reference_rate is None:
+		# No Currency Exchange record – cannot validate.
+		return ""
+
+	# Phase 5: guard against division by zero.
+	if flt(reference_rate) == 0:
+		return f"ZERO_REF_RATE: {payment_currency}→{party_currency}"
+
+	relative_diff = abs(flt(derived_rate) - flt(reference_rate)) / abs(flt(reference_rate))
+	if relative_diff > _RATE_MISMATCH_THRESHOLD:
+		return (
+			f"RATE_MISMATCH: derived={flt(derived_rate, 6)} "
+			f"vs ref={flt(reference_rate, 6)} "
+			f"({payment_currency}→{party_currency})"
+		)
+	return ""
 
 
 def _fix_account_currency_per_row(data):
@@ -318,10 +581,15 @@ def _fix_account_currency_per_row(data):
 	presentation currency for all rows.  This function fills in the correct
 	per-row currency using two sources:
 
-	1. **Payment Entry rows** – the ``paid_from_account_currency`` /
-	   ``paid_to_account_currency`` fields from the linked Payment Entry are
-	   used so the "Transaction Currency" columns reflect the actual currency
-	   of ``paid_amount`` / ``received_amount`` rather than a global fallback.
+	1. **Payment Entry rows** – Phase 3 override: ``transaction_currency``
+	   and the in-memory ``debit_in_account_currency`` /
+	   ``credit_in_account_currency`` are set to the **payment currency**
+	   (e.g. JOD) for ALL GL rows of the PE, including the party row.
+	   This ensures that when "Add Columns in Transaction Currency" is
+	   enabled the standard columns display a uniform JOD view instead of
+	   mixing ILS (party side) and JOD (bank side).
+	   The original ``account_currency`` (ILS for the party account) is
+	   preserved separately so the account master information is not lost.
 
 	2. **All other rows** – the ``account_currency`` is read from the
 	   ``Account`` master (batch-fetched for performance).
@@ -341,9 +609,12 @@ def _fix_account_currency_per_row(data):
 	)
 	account_currency_map = {r.name: r.account_currency for r in account_rows if r.account_currency}
 
-	# Batch-fetch Payment Entry currencies for GL rows that come from Payment Entries.
+	# Batch-fetch Payment Entry currencies and amounts for GL rows that come
+	# from Payment Entries.
 	# Map: (pe_name, account_name) → account_currency
 	pe_account_currency_map = {}
+	# Map: pe_name → (payment_currency, received_amount, paid_amount, target_exchange_rate)
+	pe_payment_info = {}
 	pe_names = {
 		row.get("voucher_no")
 		for row in data
@@ -355,13 +626,32 @@ def _fix_account_currency_per_row(data):
 		pe_rows = frappe.get_all(
 			"Payment Entry",
 			filters={"name": ["in", list(pe_names)]},
-			fields=["name", "paid_from", "paid_to", "paid_from_account_currency", "paid_to_account_currency"],
+			fields=[
+				"name",
+				"paid_from", "paid_to",
+				"paid_from_account_currency", "paid_to_account_currency",
+				"received_amount", "paid_amount",
+				"target_exchange_rate",
+			],
 		)
 		for pe in pe_rows:
 			if pe.paid_from and pe.paid_from_account_currency:
 				pe_account_currency_map[(pe.name, pe.paid_from)] = pe.paid_from_account_currency
 			if pe.paid_to and pe.paid_to_account_currency:
 				pe_account_currency_map[(pe.name, pe.paid_to)] = pe.paid_to_account_currency
+
+			# Determine the payment currency (Phase 3).
+			pay_cur = pe.paid_to_account_currency or pe.paid_from_account_currency or ""
+			if pe.paid_from_account_currency and pe.paid_to_account_currency:
+				if pe.paid_from_account_currency != pe.paid_to_account_currency:
+					pay_cur = pe.paid_to_account_currency  # bank / MOP side
+
+			pe_payment_info[pe.name] = {
+				"payment_currency": pay_cur,
+				"received_amount": flt(pe.received_amount or 0),
+				"paid_amount": flt(pe.paid_amount or 0),
+				"target_exchange_rate": flt(pe.target_exchange_rate or 0),
+			}
 
 	for row in data:
 		if not isinstance(row, dict):
@@ -370,15 +660,50 @@ def _fix_account_currency_per_row(data):
 		if not account:
 			continue
 
-		# For Payment Entry rows, prefer the currency stored on the PE document.
+		# For Payment Entry rows apply Phase 3: force transaction_currency to
+		# the payment currency (JOD) for ALL GL rows of the PE and update the
+		# in-memory account-currency amounts accordingly.
 		if row.get("voucher_type") == "Payment Entry" and row.get("voucher_no"):
-			pe_currency = pe_account_currency_map.get((row["voucher_no"], account))
+			pe_name = row["voucher_no"]
+			info = pe_payment_info.get(pe_name, {})
+			payment_currency = info.get("payment_currency", "")
+
+			# Keep the original account_currency from the Account master (or
+			# PE field) so downstream code that needs the real currency can
+			# still access it.  We only override transaction_currency for the
+			# report display layer.
+			pe_currency = pe_account_currency_map.get((pe_name, account))
 			if pe_currency:
 				row["account_currency"] = pe_currency
-				# Keep transaction_currency in sync so the "Add Columns in
-				# Transaction Currency" columns display the correct symbol.
-				row["transaction_currency"] = pe_currency
-				continue
+			elif account_currency_map.get(account):
+				row["account_currency"] = account_currency_map[account]
+
+			if payment_currency:
+				# Phase 3: override transaction_currency to payment currency
+				# (JOD) for BOTH sides so "Add Columns in Transaction Currency"
+				# displays a uniform payment-currency view.
+				row["transaction_currency"] = payment_currency
+
+				# Restate debit_in_account_currency / credit_in_account_currency
+				# in payment currency (JOD) so the standard ERPNext column
+				# formatter renders the correct amount and currency symbol.
+				received = info.get("received_amount", 0.0)
+				target_rate = info.get("target_exchange_rate", 0.0)
+				debit_company = flt(row.get("debit") or 0)
+				credit_company = flt(row.get("credit") or 0)
+				base = debit_company or credit_company
+
+				if not received and base and target_rate:
+					received = flt(base / target_rate, 9)
+
+				if received:
+					if debit_company:
+						row["debit_in_account_currency"] = received
+						row["credit_in_account_currency"] = 0.0
+					elif credit_company:
+						row["debit_in_account_currency"] = 0.0
+						row["credit_in_account_currency"] = received
+			continue
 
 		# Fall back to Account master currency for all other rows.
 		if account_currency_map.get(account):
