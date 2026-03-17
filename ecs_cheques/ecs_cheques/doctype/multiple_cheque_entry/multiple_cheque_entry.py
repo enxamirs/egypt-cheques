@@ -272,22 +272,20 @@ def create_payment_entry_from_cheque(docname, row_id):
 
 		if paid_from_currency != company_currency and paid_to_currency != company_currency:
 			# Both accounts are in non-company currencies (e.g. party=ILS, bank=JOD,
-			# company=USD).  The stored exchange_rate_party_to_mop is the ILS→JOD rate,
-			# NOT the ILS→USD rate ERPNext needs for source_exchange_rate.
-			# Fetch the correct rates from Currency Exchange.
-			source_exchange_rate = _fetch_exchange_rate_to_company(
-				paid_from_currency, company_currency, doc.posting_date
-			)
+			# company=USD).
+			#
+			# Strict mapping: paid_amount (party account currency, e.g. ILS) must be
+			# taken directly from amount_in_company_currency stored on the cheque row
+			# rather than re-derived from exchange rates.  This prevents ERPNext from
+			# replacing the fixed value (e.g. 3,000 ILS) with a system-recalculated
+			# figure (e.g. 4,455 ILS).
+			#
+			# Only the MOP→company rate (target) is fetched from Currency Exchange.
+			# The party→company rate (source) is derived so the GL equation balances:
+			#   paid_amount × source_rate = received_amount × target_rate = base (USD)
 			target_exchange_rate = _fetch_exchange_rate_to_company(
 				paid_to_currency, company_currency, doc.posting_date
 			)
-			if not source_exchange_rate:
-				frappe.throw(
-					_(
-						"Row {0}: No Currency Exchange record found for {1} → {2}. "
-						"Please create one before proceeding."
-					).format(row.idx or "", paid_from_currency, company_currency)
-				)
 			if not target_exchange_rate:
 				frappe.throw(
 					_(
@@ -295,11 +293,12 @@ def create_payment_entry_from_cheque(docname, row_id):
 						"Please create one before proceeding."
 					).format(row.idx or "", paid_to_currency, company_currency)
 				)
-			# Recalculate paid_amount (ILS) consistent with the company-currency base.
-			# base_amount_company = received_amount × target_exchange_rate (JOD → USD)
-			# paid_amount (ILS) = base_amount_company / source_exchange_rate (ILS → USD)
+			# paid_amount is the fixed party-account-currency amount from the cheque tool.
+			paid_amount = flt(row.amount_in_company_currency)
+			# base_company = received_amount (JOD) × target_rate (JOD → USD)
 			base_company = flt(received_amount) * flt(target_exchange_rate)
-			paid_amount = flt(base_company / source_exchange_rate, 9) if source_exchange_rate and source_exchange_rate != 0 else flt(row.amount_in_company_currency)
+			# Derive source_exchange_rate so that paid_amount × source_rate = base_company.
+			source_exchange_rate = flt(base_company / paid_amount, 9) if paid_amount else 1.0
 		elif paid_from_currency == company_currency:
 			# paid_from is company currency → source rate must be 1.
 			# target_exchange_rate converts paid_to (foreign) → company_currency.
@@ -316,12 +315,17 @@ def create_payment_entry_from_cheque(docname, row_id):
 
 		if paid_from_currency != company_currency and paid_to_currency != company_currency:
 			# Both accounts are in non-company currencies (e.g. bank=JOD, party=ILS,
-			# company=USD).  Fetch correct exchange rates to company currency.
+			# company=USD).
+			#
+			# Strict mapping: received_amount (party account currency, e.g. ILS) must be
+			# taken directly from amount_in_company_currency stored on the cheque row
+			# rather than re-derived from exchange rates.
+			#
+			# Only the MOP→company rate (source) is fetched from Currency Exchange.
+			# The party→company rate (target) is derived so the GL equation balances:
+			#   paid_amount × source_rate = received_amount × target_rate = base (USD)
 			source_exchange_rate = _fetch_exchange_rate_to_company(
 				paid_from_currency, company_currency, doc.posting_date
-			)
-			target_exchange_rate = _fetch_exchange_rate_to_company(
-				paid_to_currency, company_currency, doc.posting_date
 			)
 			if not source_exchange_rate:
 				frappe.throw(
@@ -330,17 +334,12 @@ def create_payment_entry_from_cheque(docname, row_id):
 						"Please create one before proceeding."
 					).format(row.idx or "", paid_from_currency, company_currency)
 				)
-			if not target_exchange_rate:
-				frappe.throw(
-					_(
-						"Row {0}: No Currency Exchange record found for {1} → {2}. "
-						"Please create one before proceeding."
-					).format(row.idx or "", paid_to_currency, company_currency)
-				)
-			# base_amount_company = paid_amount × source_exchange_rate (JOD → USD)
-			# received_amount (ILS) = base_company / target_exchange_rate (ILS → USD)
+			# received_amount is the fixed party-account-currency amount from the cheque tool.
+			received_amount = flt(row.amount_in_company_currency)
+			# base_company = paid_amount (JOD) × source_rate (JOD → USD)
 			base_company = flt(paid_amount) * flt(source_exchange_rate)
-			received_amount = flt(base_company / target_exchange_rate, 9) if target_exchange_rate and target_exchange_rate != 0 else flt(row.amount_in_company_currency)
+			# Derive target_exchange_rate so that received_amount × target_rate = base_company.
+			target_exchange_rate = flt(base_company / received_amount, 9) if received_amount else 1.0
 		elif paid_from_currency == company_currency:
 			# Bank account is in company currency; party account is foreign.
 			source_exchange_rate = 1.0

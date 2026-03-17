@@ -993,3 +993,346 @@ class TestJodToUsdCrossAccountReceive(unittest.TestCase):
 			places=3,
 			msg="exchange_rate_party_to_mop must not be used as source_exchange_rate "
 			"when paid_from = company currency")
+
+
+# ---------------------------------------------------------------------------
+# Triple-currency Receive: company=USD, party=ILS, cheque/bank=JOD
+# ---------------------------------------------------------------------------
+
+class TestTripleCurrencyReceive(unittest.TestCase):
+	"""company=USD, paid_from=ILS (party), paid_to=JOD (bank) – Receive.
+
+	This is the exact scenario from the bug report:
+	  company_currency              = USD
+	  paid_from account currency    = ILS  (customer receivable)
+	  paid_to   account currency    = JOD  (cheque/bank account)
+	  row.paid_amount               = 1,000 JOD  (cheque face value)
+	  row.amount_in_company_currency= 3,000 ILS   (fixed party-account amount)
+	  row.target_exchange_rate      = 3.0          (JOD → ILS, NOT used for PE)
+	  JOD → USD rate (Currency Exchange) = 1.410437
+
+	Expected Payment Entry:
+	  paid_amount          = 3,000 ILS  (strict copy of amount_in_company_currency)
+	  received_amount      = 1,000 JOD
+	  target_exchange_rate = 1.410437   (JOD → USD, fetched from Currency Exchange)
+	  source_exchange_rate = base / paid_amount
+	                       = (1000 × 1.410437) / 3000 ≈ 0.470146
+	  GL balance: 3000 × 0.470146 ≈ 1000 × 1.410437 ≈ 1,410.437 USD
+	"""
+
+	_CHEQUE_JOD = 1000.0
+	_ILS_AMOUNT = 3000.0
+	_JOD_TO_USD = 1.410437
+	_EXCH_MOP_TO_PARTY = 3.0    # JOD → ILS (stored on row, must NOT affect PE)
+
+	def _make_row(self):
+		return _Row(
+			name="ROW-TRIPLE-RCV",
+			idx=1,
+			account_paid_from="ILS-Receivable",
+			account_paid_to="JOD-Bank",
+			paid_amount=self._CHEQUE_JOD,
+			amount_in_company_currency=self._ILS_AMOUNT,
+			target_exchange_rate=self._EXCH_MOP_TO_PARTY,
+			exchange_rate_mop_to_party=self._EXCH_MOP_TO_PARTY,
+			exchange_rate_party_to_mop=round(1.0 / self._EXCH_MOP_TO_PARTY, 9),
+			cheque_currency="JOD",
+			mode_of_payment="Cheque",
+			party_type="Customer",
+			party="CUST-TRIPLE",
+			cheque_type="Crossed",
+			reference_no="CHQ-TRIPLE-001",
+			reference_date="2024-01-15",
+			first_beneficiary="Company",
+			person_name="Test",
+			issuer_name="Test",
+			picture_of_check=None,
+			bank="JOD Bank",
+			payment_entry=None,
+		)
+
+	def setUp(self):
+		import sys
+		self._frappe = sys.modules["frappe"]
+		self._inserted = {}
+		self._submitted = False
+		self._set_values = []
+
+		row = self._make_row()
+		doc = _Doc(
+			name="MCE-TRIPLE-RCV",
+			company="USD Co",
+			payment_type="Receive",
+			posting_date="2024-01-15",
+			mode_of_payment="Cheque",
+			mode_of_payment_type="Cheque",
+			cheque_bank="JOD Bank",
+			bank_acc="Bank-JOD",
+			cheque_table=[row],
+			cheque_table_2=[],
+		)
+
+		class _FakePE:
+			def __init__(inner_self, d):
+				inner_self.__dict__.update(d)
+				inner_self.name = "PE-TRIPLE-RCV-001"
+				inner_self.flags = type("F", (), {"ignore_permissions": False})()
+
+			def insert(inner_self):
+				self._inserted = inner_self.__dict__.copy()
+
+			def submit(inner_self):
+				self._submitted = True
+
+		def _get_doc(arg, *rest):
+			if arg == "Multiple Cheque Entry":
+				return doc
+			return _FakePE(arg)
+
+		self._frappe.get_doc = _get_doc
+
+		_jod_to_usd = self._JOD_TO_USD
+
+		class _DB:
+			def get_value(self_, doctype, name, field, **kwargs):
+				if doctype == "Company":
+					return "USD"
+				if doctype == "Account":
+					if name == "ILS-Receivable":
+						return "ILS"
+					if name == "JOD-Bank":
+						return "JOD"
+				if doctype == "Currency Exchange":
+					# _fetch_exchange_rate_to_company queries Currency Exchange.
+					# Return JOD→USD rate.
+					if isinstance(name, dict):
+						fc = name.get("from_currency", "")
+						tc = name.get("to_currency", "")
+						if fc == "JOD" and tc == "USD":
+							return _jod_to_usd
+					return None
+				return None
+
+			def set_value(self_, doctype, name, field, value):
+				self._set_values.append((doctype, name, field, value))
+
+		self._frappe.db = _DB()
+		self._frappe.throw = lambda msg, exc=None: (_ for _ in ()).throw(Exception(msg))
+
+	def test_paid_amount_is_fixed_ils_value(self):
+		"""paid_amount must be the fixed 3,000 ILS from amount_in_company_currency."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-RCV", "ROW-TRIPLE-RCV")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("paid_amount"), self._ILS_AMOUNT, places=3,
+			msg="paid_amount must be the fixed ILS value (3000), not a recalculation")
+
+	def test_paid_amount_is_not_recalculated_from_usd_ils_rate(self):
+		"""paid_amount must NOT equal the system-recalculated ILS value (4,455 ILS).
+
+		The old (buggy) behaviour fetched ILS→USD from Currency Exchange and then
+		divided the USD base by that rate, producing ~4,455 ILS instead of 3,000 ILS.
+		"""
+		create_payment_entry_from_cheque("MCE-TRIPLE-RCV", "ROW-TRIPLE-RCV")
+		pe = self._inserted
+		# Approximate recalculated value if ILS→USD ≈ 0.3166:
+		# base = 1000 × 1.410437 = 1410.437; paid = 1410.437 / 0.3166 ≈ 4455
+		wrong_value = (self._CHEQUE_JOD * self._JOD_TO_USD) / 0.3166
+		self.assertNotAlmostEqual(pe.get("paid_amount"), wrong_value, places=0,
+			msg="paid_amount must not be the auto-recalculated value (~4455 ILS)")
+
+	def test_received_amount_is_jod_cheque_value(self):
+		"""received_amount must equal the JOD cheque face value (1,000 JOD)."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-RCV", "ROW-TRIPLE-RCV")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("received_amount"), self._CHEQUE_JOD, places=3,
+			msg="received_amount must equal the original JOD cheque amount")
+
+	def test_target_exchange_rate_is_jod_to_usd(self):
+		"""target_exchange_rate must be the JOD→USD rate (1.410437)."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-RCV", "ROW-TRIPLE-RCV")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("target_exchange_rate"), self._JOD_TO_USD, places=4,
+			msg="target_exchange_rate must be the JOD→USD rate from Currency Exchange")
+
+	def test_source_exchange_rate_derived_from_balance(self):
+		"""source_exchange_rate must be derived so the GL equation balances.
+
+		source_rate = (received × target) / paid
+		            = (1000 × 1.410437) / 3000 ≈ 0.470146
+		"""
+		create_payment_entry_from_cheque("MCE-TRIPLE-RCV", "ROW-TRIPLE-RCV")
+		pe = self._inserted
+		expected_source = (self._CHEQUE_JOD * self._JOD_TO_USD) / self._ILS_AMOUNT
+		self.assertAlmostEqual(pe.get("source_exchange_rate"), expected_source, places=4,
+			msg="source_exchange_rate must balance the GL equation")
+
+	def test_gl_balance(self):
+		"""paid_amount × source_rate must equal received_amount × target_rate (GL invariant)."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-RCV", "ROW-TRIPLE-RCV")
+		pe = self._inserted
+		base_paid = pe.get("paid_amount") * pe.get("source_exchange_rate")
+		base_received = pe.get("received_amount") * pe.get("target_exchange_rate")
+		self.assertAlmostEqual(base_paid, base_received, places=2,
+			msg="GL imbalance: base_paid={0} ≠ base_received={1}".format(
+				base_paid, base_received))
+
+
+# ---------------------------------------------------------------------------
+# Triple-currency Pay: company=USD, bank=JOD, party=ILS
+# ---------------------------------------------------------------------------
+
+class TestTripleCurrencyPay(unittest.TestCase):
+	"""company=USD, paid_from=JOD (bank), paid_to=ILS (supplier) – Pay.
+
+	Mirror of TestTripleCurrencyReceive for the Pay direction:
+	  company_currency              = USD
+	  paid_from account currency    = JOD  (cheque/bank account)
+	  paid_to   account currency    = ILS  (supplier payable)
+	  row.paid_amount               = 1,000 JOD  (cheque face value)
+	  row.amount_in_company_currency= 3,000 ILS   (fixed party-account amount)
+	  JOD → USD rate (Currency Exchange) = 1.410437
+
+	Expected Payment Entry:
+	  paid_amount          = 1,000 JOD
+	  received_amount      = 3,000 ILS  (strict copy of amount_in_company_currency)
+	  source_exchange_rate = 1.410437   (JOD → USD, fetched from Currency Exchange)
+	  target_exchange_rate = base / received
+	                       = (1000 × 1.410437) / 3000 ≈ 0.470146
+	"""
+
+	_CHEQUE_JOD = 1000.0
+	_ILS_AMOUNT = 3000.0
+	_JOD_TO_USD = 1.410437
+
+	def _make_row(self):
+		return _Row(
+			name="ROW-TRIPLE-PAY",
+			idx=1,
+			account_paid_from="JOD-Bank",
+			account_paid_to="ILS-Payable",
+			paid_amount=self._CHEQUE_JOD,
+			amount_in_company_currency=self._ILS_AMOUNT,
+			target_exchange_rate=3.0,
+			cheque_currency="JOD",
+			mode_of_payment="Cheque",
+			party_type="Supplier",
+			party="SUPP-TRIPLE",
+			cheque_type="Crossed",
+			reference_no="CHQ-TRIPLE-PAY-001",
+			reference_date="2024-01-15",
+			first_beneficiary="Company",
+			person_name="Test",
+			issuer_name="Test",
+			picture_of_check=None,
+			bank="JOD Bank",
+			payment_entry=None,
+		)
+
+	def setUp(self):
+		import sys
+		self._frappe = sys.modules["frappe"]
+		self._inserted = {}
+		self._submitted = False
+		self._set_values = []
+
+		row = self._make_row()
+		doc = _Doc(
+			name="MCE-TRIPLE-PAY",
+			company="USD Co",
+			payment_type="Pay",
+			posting_date="2024-01-15",
+			mode_of_payment="Cheque",
+			mode_of_payment_type="Cheque",
+			cheque_bank="JOD Bank",
+			bank_acc="Bank-JOD",
+			cheque_table=[],
+			cheque_table_2=[row],
+		)
+
+		class _FakePE:
+			def __init__(inner_self, d):
+				inner_self.__dict__.update(d)
+				inner_self.name = "PE-TRIPLE-PAY-001"
+				inner_self.flags = type("F", (), {"ignore_permissions": False})()
+
+			def insert(inner_self):
+				self._inserted = inner_self.__dict__.copy()
+
+			def submit(inner_self):
+				self._submitted = True
+
+		def _get_doc(arg, *rest):
+			if arg == "Multiple Cheque Entry":
+				return doc
+			return _FakePE(arg)
+
+		self._frappe.get_doc = _get_doc
+
+		_jod_to_usd = self._JOD_TO_USD
+
+		class _DB:
+			def get_value(self_, doctype, name, field, **kwargs):
+				if doctype == "Company":
+					return "USD"
+				if doctype == "Account":
+					if name == "JOD-Bank":
+						return "JOD"
+					if name == "ILS-Payable":
+						return "ILS"
+				if doctype == "Currency Exchange":
+					if isinstance(name, dict):
+						fc = name.get("from_currency", "")
+						tc = name.get("to_currency", "")
+						if fc == "JOD" and tc == "USD":
+							return _jod_to_usd
+					return None
+				return None
+
+			def set_value(self_, doctype, name, field, value):
+				self._set_values.append((doctype, name, field, value))
+
+		self._frappe.db = _DB()
+		self._frappe.throw = lambda msg, exc=None: (_ for _ in ()).throw(Exception(msg))
+
+	def test_paid_amount_is_jod_cheque_value(self):
+		"""paid_amount must equal the JOD cheque face value (1,000 JOD)."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-PAY", "ROW-TRIPLE-PAY")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("paid_amount"), self._CHEQUE_JOD, places=3,
+			msg="paid_amount must equal the original JOD cheque amount")
+
+	def test_received_amount_is_fixed_ils_value(self):
+		"""received_amount must be the fixed 3,000 ILS from amount_in_company_currency."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-PAY", "ROW-TRIPLE-PAY")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("received_amount"), self._ILS_AMOUNT, places=3,
+			msg="received_amount must be the fixed ILS value (3000), not a recalculation")
+
+	def test_source_exchange_rate_is_jod_to_usd(self):
+		"""source_exchange_rate must be the JOD→USD rate (1.410437)."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-PAY", "ROW-TRIPLE-PAY")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("source_exchange_rate"), self._JOD_TO_USD, places=4,
+			msg="source_exchange_rate must be the JOD→USD rate from Currency Exchange")
+
+	def test_target_exchange_rate_derived_from_balance(self):
+		"""target_exchange_rate must be derived so the GL equation balances.
+
+		target_rate = (paid × source) / received
+		            = (1000 × 1.410437) / 3000 ≈ 0.470146
+		"""
+		create_payment_entry_from_cheque("MCE-TRIPLE-PAY", "ROW-TRIPLE-PAY")
+		pe = self._inserted
+		expected_target = (self._CHEQUE_JOD * self._JOD_TO_USD) / self._ILS_AMOUNT
+		self.assertAlmostEqual(pe.get("target_exchange_rate"), expected_target, places=4,
+			msg="target_exchange_rate must balance the GL equation")
+
+	def test_gl_balance(self):
+		"""paid_amount × source_rate must equal received_amount × target_rate (GL invariant)."""
+		create_payment_entry_from_cheque("MCE-TRIPLE-PAY", "ROW-TRIPLE-PAY")
+		pe = self._inserted
+		base_paid = pe.get("paid_amount") * pe.get("source_exchange_rate")
+		base_received = pe.get("received_amount") * pe.get("target_exchange_rate")
+		self.assertAlmostEqual(base_paid, base_received, places=2,
+			msg="GL imbalance: base_paid={0} ≠ base_received={1}".format(
+				base_paid, base_received))
