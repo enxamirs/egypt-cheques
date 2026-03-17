@@ -5,7 +5,7 @@ import frappe
 import io
 from frappe.model.document import Document
 from frappe import _
-from frappe.utils import flt, nowdate
+from frappe.utils import flt, nowdate, getdate
 
 
 # ---------------------------------------------------------------------------
@@ -18,6 +18,64 @@ def _get_account_currency_db(account_name, company_currency):
 	if not account_name:
 		return company_currency
 	return frappe.db.get_value("Account", account_name, "account_currency") or company_currency
+
+
+def _fetch_exchange_rate_to_company(from_currency, company_currency, posting_date=None):
+	"""Fetch the exchange rate from *from_currency* to *company_currency* using the
+	Currency Exchange DocType.
+
+	Returns 1.0 when currencies are equal.  Searches for the most recent rate on or
+	before *posting_date*.  Tries the direct pair first, then the inverse pair.
+	Returns None when no matching record is found.
+	"""
+	if not from_currency or from_currency == company_currency:
+		return 1.0
+
+	date_filter = getdate(posting_date) if posting_date else getdate(nowdate())
+
+	# Direct: from_currency → company_currency
+	rate = frappe.db.get_value(
+		"Currency Exchange",
+		{"from_currency": from_currency, "to_currency": company_currency,
+		 "date": ["<=", date_filter]},
+		"exchange_rate",
+		order_by="date desc",
+	)
+	if rate:
+		return flt(rate)
+
+	# Inverse: company_currency → from_currency
+	rate = frappe.db.get_value(
+		"Currency Exchange",
+		{"from_currency": company_currency, "to_currency": from_currency,
+		 "date": ["<=", date_filter]},
+		"exchange_rate",
+		order_by="date desc",
+	)
+	if rate and flt(rate) > 0:
+		return flt(1.0 / flt(rate), 9)
+
+	return None
+
+
+@frappe.whitelist()
+def get_exchange_rate_to_company(from_currency, company, posting_date=None):
+	"""Whitelisted API: return the exchange rate from *from_currency* to the
+	company's default currency.  Used by the client-side ``update_amount_in_usd``
+	helper to avoid having to inline the Currency Exchange lookup in JS.
+
+	Returns the numeric rate (or 1.0 as a fallback) so callers can always
+	multiply: ``amount_in_company_currency = paid_amount × rate``.
+	"""
+	company_currency = (
+		frappe.db.get_value("Company", company, "default_currency") or ""
+		if company else
+		frappe.db.get_default("currency") or ""
+	)
+	if not company_currency or from_currency == company_currency:
+		return 1.0
+	rate = _fetch_exchange_rate_to_company(from_currency, company_currency, posting_date)
+	return rate if rate is not None else 1.0
 
 
 def _compute_payment_entry_amounts(
@@ -211,14 +269,37 @@ def create_payment_entry_from_cheque(docname, row_id):
 		# paid_from = party account, paid_to = bank/MOP account.
 		paid_amount = flt(row.amount_in_company_currency)   # in paid_from currency
 		received_amount = flt(row.paid_amount)              # in paid_to currency
-		exch_party_to_mop = flt(getattr(row, "exchange_rate_party_to_mop", 0))
-		if exch_party_to_mop > 0 and paid_from_currency != company_currency and paid_to_currency != company_currency:
-			# Both accounts in non-company currencies: use bidirectional rate as source.
-			# target_exchange_rate satisfies: paid_amount * source = received * target
-			source_exchange_rate = exch_party_to_mop
-			target_exchange_rate = flt(
-				paid_amount * source_exchange_rate / received_amount if received_amount else 1.0, 9
+
+		if paid_from_currency != company_currency and paid_to_currency != company_currency:
+			# Both accounts are in non-company currencies (e.g. party=ILS, bank=JOD,
+			# company=USD).  The stored exchange_rate_party_to_mop is the ILS→JOD rate,
+			# NOT the ILS→USD rate ERPNext needs for source_exchange_rate.
+			# Fetch the correct rates from Currency Exchange.
+			source_exchange_rate = _fetch_exchange_rate_to_company(
+				paid_from_currency, company_currency, doc.posting_date
 			)
+			target_exchange_rate = _fetch_exchange_rate_to_company(
+				paid_to_currency, company_currency, doc.posting_date
+			)
+			if not source_exchange_rate:
+				frappe.throw(
+					_(
+						"Row {0}: No Currency Exchange record found for {1} → {2}. "
+						"Please create one before proceeding."
+					).format(row.idx or "", paid_from_currency, company_currency)
+				)
+			if not target_exchange_rate:
+				frappe.throw(
+					_(
+						"Row {0}: No Currency Exchange record found for {1} → {2}. "
+						"Please create one before proceeding."
+					).format(row.idx or "", paid_to_currency, company_currency)
+				)
+			# Recalculate paid_amount (ILS) consistent with the company-currency base.
+			# base_amount_company = received_amount × target_exchange_rate (JOD → USD)
+			# paid_amount (ILS) = base_amount_company / source_exchange_rate (ILS → USD)
+			base_company = flt(received_amount) * flt(target_exchange_rate)
+			paid_amount = flt(base_company / source_exchange_rate, 9) if source_exchange_rate and source_exchange_rate != 0 else flt(row.amount_in_company_currency)
 		elif paid_from_currency == company_currency:
 			# paid_from is company currency → source rate must be 1.
 			# target_exchange_rate converts paid_to (foreign) → company_currency.
@@ -229,11 +310,45 @@ def create_payment_entry_from_cheque(docname, row_id):
 			source_exchange_rate = flt(1.0 / stored_rate, 9) if stored_rate else 1.0
 			target_exchange_rate = 1.0
 	else:
-		# Pay: paid_from = foreign (e.g. USD), paid_to = company currency (ILS)
-		paid_amount = flt(row.paid_amount)                  # USD
-		received_amount = flt(row.amount_in_company_currency)  # ILS
-		source_exchange_rate = stored_rate                  # USD → ILS
-		target_exchange_rate = 1.0
+		# Pay: paid_from = bank/MOP account, paid_to = party account.
+		paid_amount = flt(row.paid_amount)                     # in paid_from currency
+		received_amount = flt(row.amount_in_company_currency)  # in paid_to currency
+
+		if paid_from_currency != company_currency and paid_to_currency != company_currency:
+			# Both accounts are in non-company currencies (e.g. bank=JOD, party=ILS,
+			# company=USD).  Fetch correct exchange rates to company currency.
+			source_exchange_rate = _fetch_exchange_rate_to_company(
+				paid_from_currency, company_currency, doc.posting_date
+			)
+			target_exchange_rate = _fetch_exchange_rate_to_company(
+				paid_to_currency, company_currency, doc.posting_date
+			)
+			if not source_exchange_rate:
+				frappe.throw(
+					_(
+						"Row {0}: No Currency Exchange record found for {1} → {2}. "
+						"Please create one before proceeding."
+					).format(row.idx or "", paid_from_currency, company_currency)
+				)
+			if not target_exchange_rate:
+				frappe.throw(
+					_(
+						"Row {0}: No Currency Exchange record found for {1} → {2}. "
+						"Please create one before proceeding."
+					).format(row.idx or "", paid_to_currency, company_currency)
+				)
+			# base_amount_company = paid_amount × source_exchange_rate (JOD → USD)
+			# received_amount (ILS) = base_company / target_exchange_rate (ILS → USD)
+			base_company = flt(paid_amount) * flt(source_exchange_rate)
+			received_amount = flt(base_company / target_exchange_rate, 9) if target_exchange_rate and target_exchange_rate != 0 else flt(row.amount_in_company_currency)
+		elif paid_from_currency == company_currency:
+			# Bank account is in company currency; party account is foreign.
+			source_exchange_rate = 1.0
+			target_exchange_rate = flt(received_amount / paid_amount, 9) if paid_amount > 0 else stored_rate
+		else:
+			# paid_to_currency == company_currency (party account = company currency)
+			source_exchange_rate = stored_rate   # paid_from → company
+			target_exchange_rate = 1.0
 
 	pe_dict = {
 		"doctype": "Payment Entry",
@@ -288,6 +403,42 @@ def create_payment_entry_from_cheque(docname, row_id):
 
 
 class MultipleChequeEntry(Document):
+	def before_save(self):
+		"""Compute amount_in_usd for all child rows before saving."""
+		self._compute_amount_in_usd_all_rows()
+
+	def _compute_amount_in_usd_all_rows(self):
+		"""Calculate amount_in_usd (amount in company currency) for every child row.
+
+		Fetches the company currency once, then for each cheque row converts
+		``paid_amount`` from ``cheque_currency`` → company currency using the
+		Currency Exchange DocType.  Results are stored directly on the row
+		objects so they are saved with the document.
+		"""
+		company_currency = (
+			frappe.db.get_value("Company", self.company, "default_currency") or ""
+			if self.company else ""
+		)
+		if not company_currency:
+			return
+
+		posting_date = self.posting_date or nowdate()
+		tables = []
+		if self.payment_type == "Receive":
+			tables.append((self.cheque_table or [], "Cheque Table Receive", "account_currency"))
+		else:
+			tables.append((self.cheque_table_2 or [], "Cheque Table Pay", "account_currency_from"))
+
+		for rows, _child_doctype, currency_field in tables:
+			for row in rows:
+				cheque_currency = getattr(row, "cheque_currency", None) or getattr(row, currency_field, None) or ""
+				paid_amount = flt(getattr(row, "paid_amount", 0))
+				if not cheque_currency or cheque_currency == company_currency:
+					row.amount_in_usd = paid_amount
+				else:
+					rate = _fetch_exchange_rate_to_company(cheque_currency, company_currency, posting_date)
+					row.amount_in_usd = flt(paid_amount * (rate or 1.0), 9)
+
 	def on_cancel(self):
 		"""Cancel linked Payment Entries when Multiple Cheque Entry is cancelled."""
 		pe_names = self._get_linked_payment_entries()

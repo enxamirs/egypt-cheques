@@ -8,11 +8,41 @@ Fixes the "Add Columns in Transaction Currency" feature so that each GL row
 uses its own ``account_currency`` (sourced directly from the GL Entry / Account
 master) rather than a shared filter/presentation currency.
 
+Also adds two extra data columns when the transaction-currency option is enabled:
+
+* ``debit_in_payment_currency``  – Debit amount in the payment method (cheque)
+  currency (e.g. JOD when the MOP account is a JOD bank account).
+* ``credit_in_payment_currency`` – Credit amount in the same payment currency.
+
+These columns allow the report to show the "raw" cheque value on BOTH the
+party-account row (ILS debit) and the bank/wallet row (JOD credit) so that
+the user can see all three values: USD (company), JOD (payment), ILS (party).
+
 This module is monkey-patched onto the ERPNext GL report at app boot time via
 the ``boot_session`` hook in hooks.py.
 """
 
 import frappe
+
+
+# Column definitions for the extra payment-currency columns injected into the
+# GL report.  They are appended after the standard transaction-currency columns.
+_PAYMENT_CURRENCY_COLUMNS = [
+    {
+        "fieldname": "debit_in_payment_currency",
+        "label": "Debit (Payment Currency)",
+        "fieldtype": "Currency",
+        "options": "payment_currency",
+        "width": 130,
+    },
+    {
+        "fieldname": "credit_in_payment_currency",
+        "label": "Credit (Payment Currency)",
+        "fieldtype": "Currency",
+        "options": "payment_currency",
+        "width": 130,
+    },
+]
 
 
 def patch_general_ledger_report(*args, **kwargs):
@@ -45,12 +75,134 @@ def patch_general_ledger_report(*args, **kwargs):
 		if isinstance(result, (list, tuple)) and len(result) >= 2:
 			columns, data = result[0], result[1]
 			_fix_account_currency_per_row(data)
+
+			# Enrich data with payment-currency cross-reference values.
+			_add_payment_currency_data(data)
+
+			# Inject the extra columns if the transaction-currency option is on.
+			show_tx_currency = (
+				filters
+				and isinstance(filters, dict)
+				and filters.get("add_values_in_transaction_currency")
+			)
+			if show_tx_currency:
+				columns = _inject_payment_currency_columns(columns)
+
 			return (columns, data) + tuple(result[2:])
 
 		return result
 
 	gl_module.execute = _patched_execute
 	gl_module._ecs_patched = True
+
+
+def _inject_payment_currency_columns(columns):
+	"""Return a new columns list with the payment-currency columns appended.
+
+	Avoids duplicating them if the report is executed multiple times in the
+	same process (e.g. during exports).
+	"""
+	existing_fieldnames = {
+		(c.get("fieldname") if isinstance(c, dict) else c)
+		for c in columns
+	}
+	extra = [
+		col for col in _PAYMENT_CURRENCY_COLUMNS
+		if col["fieldname"] not in existing_fieldnames
+	]
+	return list(columns) + extra
+
+
+def _add_payment_currency_data(data):
+	"""Populate ``debit_in_payment_currency``, ``credit_in_payment_currency``,
+	and ``payment_currency`` for GL rows that originate from Payment Entries.
+
+	For each Payment Entry referenced in the data, we fetch:
+	- ``paid_to_account_currency``  – the bank/wallet account currency (e.g. JOD)
+	- ``received_amount``           – the amount in that currency
+
+	Both the party-account debit row and the bank-account credit row of the same
+	PE are then stamped with the JOD amounts so the report shows a consistent
+	payment-currency column on both sides.
+	"""
+	if not data:
+		return
+
+	pe_names = {
+		row.get("voucher_no")
+		for row in data
+		if isinstance(row, dict)
+		and row.get("voucher_type") == "Payment Entry"
+		and row.get("voucher_no")
+	}
+	if not pe_names:
+		return
+
+	pe_rows = frappe.get_all(
+		"Payment Entry",
+		filters={"name": ["in", list(pe_names)]},
+		fields=[
+			"name",
+			"paid_from", "paid_to",
+			"paid_from_account_currency", "paid_to_account_currency",
+			"paid_amount", "received_amount",
+			"source_exchange_rate", "target_exchange_rate",
+		],
+	)
+
+	# Build map: pe_name → PE data
+	pe_map = {pe.name: pe for pe in pe_rows}
+
+	for row in data:
+		if not isinstance(row, dict):
+			continue
+		if row.get("voucher_type") != "Payment Entry":
+			continue
+		pe_name = row.get("voucher_no")
+		if not pe_name or pe_name not in pe_map:
+			continue
+
+		pe = pe_map[pe_name]
+		account = row.get("account")
+
+		# Determine the "payment currency" – the currency of the MOP/bank account.
+		# For Receive: bank account is paid_to (e.g. JOD wallet).
+		# For Pay:     bank account is paid_from (e.g. JOD bank).
+		# We use paid_to_account_currency as the canonical payment currency since
+		# for Receive it is the cheque/bank currency, and for Pay we fall back to
+		# paid_from_account_currency.
+		payment_currency = (
+			pe.paid_to_account_currency
+			or pe.paid_from_account_currency
+			or ""
+		)
+		row["payment_currency"] = payment_currency
+
+		# Determine which account is the "bank" side (paid_to for Receive / paid_from for Pay).
+		# The bank-side amount is received_amount (for Receive) in payment currency.
+		# For the party-side row we derive the payment-currency equivalent from the GL
+		# base amount using the target exchange rate.
+		debit_company = row.get("debit") or 0
+		credit_company = row.get("credit") or 0
+		base_company = debit_company or credit_company
+
+		target_rate = pe.target_exchange_rate or 1.0
+		if target_rate and target_rate != 0:
+			payment_amount = flt(base_company / target_rate, 9)
+		else:
+			payment_amount = flt(base_company, 9)
+
+		if account == pe.paid_to:
+			# Bank/wallet credit row – use received_amount directly.
+			row["debit_in_payment_currency"] = 0
+			row["credit_in_payment_currency"] = pe.received_amount or payment_amount
+		elif account == pe.paid_from:
+			# Party/bank debit row – derive from base company amount.
+			row["debit_in_payment_currency"] = payment_amount
+			row["credit_in_payment_currency"] = 0
+		else:
+			row["debit_in_payment_currency"] = payment_amount if debit_company else 0
+			row["credit_in_payment_currency"] = payment_amount if credit_company else 0
 
 
 def _fix_account_currency_per_row(data):

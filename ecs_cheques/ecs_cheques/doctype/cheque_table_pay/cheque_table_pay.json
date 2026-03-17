@@ -16,6 +16,7 @@
   "paid_amount",
   "target_exchange_rate",
   "amount_in_company_currency",
+  "amount_in_usd",
   "column_break_6",
   "first_beneficiary",
   "person_name",
@@ -179,6 +180,15 @@
    "in_list_view": 1,
    "label": "Amount (Party Account Currency)",
    "options": "account_currency",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "columns": 1,
+   "fieldname": "amount_in_usd",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Amount (Company Currency)",
    "read_only": 1,
    "no_copy": 1
   },

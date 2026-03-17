@@ -17,6 +17,7 @@
   "exchange_rate_mop_to_party",
   "exchange_rate_party_to_mop",
   "amount_in_company_currency",
+  "amount_in_usd",
   "first_beneficiary",
   "issuer_name",
   "payment_entry",
@@ -222,6 +223,15 @@
    "in_list_view": 1,
    "label": "Amount (Party Account Currency)",
    "options": "account_currency_from",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "columns": 1,
+   "fieldname": "amount_in_usd",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Amount (Company Currency)",
    "read_only": 1,
    "no_copy": 1
   }

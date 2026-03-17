@@ -4,6 +4,37 @@
 // Utility: parse float safely
 function flt(val) { return parseFloat(val) || 0; }
 
+// Cache for company currency to avoid repeated server calls
+var _company_currency_cache = {};
+
+// Get company default currency (async, cached)
+function get_company_currency(company, callback) {
+    if (!company) {
+        callback(frappe.boot && frappe.boot.sysdefaults && frappe.boot.sysdefaults.currency || null);
+        return;
+    }
+    if (_company_currency_cache[company]) {
+        callback(_company_currency_cache[company]);
+        return;
+    }
+    frappe.call({
+        method: "frappe.client.get_value",
+        args: {
+            doctype: "Company",
+            fieldname: "default_currency",
+            filters: { name: company }
+        },
+        callback: function(r) {
+            if (r.message && r.message.default_currency) {
+                _company_currency_cache[company] = r.message.default_currency;
+                callback(r.message.default_currency);
+            } else {
+                callback(frappe.boot && frappe.boot.sysdefaults && frappe.boot.sysdefaults.currency || null);
+            }
+        }
+    });
+}
+
 // Helper function to get exchange rate
 function get_exchange_rate(from_currency, to_currency, date) {
     return new Promise((resolve) => {
@@ -600,12 +631,14 @@ function update_target_exchange_rate(frm, row, table_name, force) {
     if (row.account_currency_from === row.account_currency) {
         frappe.model.set_value(row.doctype, row.name, "target_exchange_rate", 1);
         update_amount_in_company_currency(frm, row, table_name);
+        update_amount_in_usd(frm, row, table_name);
         return;
     }
 
     // Skip auto-fetch if user has manually set the rate (unless forced)
     if (!force && row._rate_manually_set) {
         update_amount_in_company_currency(frm, row, table_name);
+        update_amount_in_usd(frm, row, table_name);
         return;
     }
 
@@ -641,6 +674,7 @@ function update_target_exchange_rate(frm, row, table_name, force) {
                     frappe.model.set_value(row.doctype, row.name, "exchange_rate_party_to_mop", flt(1.0 / rate, 9));
                 }
                 update_amount_in_company_currency(frm, locals[row.doctype][row.name], table_name);
+                update_amount_in_usd(frm, locals[row.doctype][row.name], table_name);
                 frm.refresh_field(table_name);
             });
     } else {
@@ -664,6 +698,7 @@ function update_target_exchange_rate(frm, row, table_name, force) {
                     frappe.model.set_value(row.doctype, row.name, "cheque_currency", row.account_currency_from);
                 }
                 update_amount_in_company_currency(frm, locals[row.doctype][row.name], table_name);
+                update_amount_in_usd(frm, locals[row.doctype][row.name], table_name);
                 frm.refresh_field(table_name);
             });
     }
@@ -684,6 +719,32 @@ function update_amount_in_company_currency(frm, row, table_name) {
     const amt_company_currency = same_currency ? amount : amount * (flt(row.target_exchange_rate) || 1);
     frappe.model.set_value(row.doctype, row.name, "amount_in_company_currency", amt_company_currency);
     frm.refresh_field(table_name);
+}
+
+// Helper to calculate and set amount_in_usd (amount in company currency, e.g. USD)
+// Uses exchange rate: cheque_currency → company_currency
+function update_amount_in_usd(frm, row, table_name) {
+    const amount = flt(row.paid_amount);
+    const cheque_currency = row.cheque_currency || (table_name === 'cheque_table' ? row.account_currency : row.account_currency_from);
+    if (!cheque_currency) {
+        frappe.model.set_value(row.doctype, row.name, "amount_in_usd", amount);
+        frm.refresh_field(table_name);
+        return;
+    }
+    get_company_currency(frm.doc.company, function(company_currency) {
+        if (!company_currency || cheque_currency === company_currency) {
+            frappe.model.set_value(row.doctype, row.name, "amount_in_usd", amount);
+            frm.refresh_field(table_name);
+            return;
+        }
+        const posting_date = frm.doc.posting_date || frappe.datetime.nowdate();
+        get_exchange_rate(cheque_currency, company_currency, posting_date)
+            .then(function(rate) {
+                const usd_amount = rate ? flt(amount * rate, 9) : amount;
+                frappe.model.set_value(row.doctype, row.name, "amount_in_usd", usd_amount);
+                frm.refresh_field(table_name);
+            });
+    });
 }
 
 // Add Excel upload/download buttons to the form
@@ -1260,14 +1321,16 @@ frappe.ui.form.on("Cheque Table Pay", "cheque_table_2_add", function(frm, cdt, c
     }
 });
 
-// --- paid_amount change: recalculate amount_in_company_currency ---
+// --- paid_amount change: recalculate amount_in_company_currency and amount_in_usd ---
 frappe.ui.form.on("Cheque Table Receive", "paid_amount", function(frm, cdt, cdn) {
     const row = locals[cdt][cdn];
     update_amount_in_company_currency(frm, row, 'cheque_table');
+    update_amount_in_usd(frm, row, 'cheque_table');
 });
 frappe.ui.form.on("Cheque Table Pay", "paid_amount", function(frm, cdt, cdn) {
     const row = locals[cdt][cdn];
     update_amount_in_company_currency(frm, row, 'cheque_table_2');
+    update_amount_in_usd(frm, row, 'cheque_table_2');
 });
 
 // --- target_exchange_rate change: mark as manually set and recalculate ---
@@ -1275,6 +1338,7 @@ frappe.ui.form.on("Cheque Table Receive", "target_exchange_rate", function(frm, 
     const row = locals[cdt][cdn];
     row._rate_manually_set = true;
     update_amount_in_company_currency(frm, row, 'cheque_table');
+    update_amount_in_usd(frm, row, 'cheque_table');
     // Keep the bidirectional rate fields in sync with target_exchange_rate
     _sync_mop_party_rates_from_target(frm, cdt, cdn, row);
 });
@@ -1328,6 +1392,7 @@ frappe.ui.form.on("Cheque Table Pay", "target_exchange_rate", function(frm, cdt,
     const row = locals[cdt][cdn];
     row._rate_manually_set = true;
     update_amount_in_company_currency(frm, row, 'cheque_table_2');
+    update_amount_in_usd(frm, row, 'cheque_table_2');
 });
 
 // --- Hide exchange rate fields in child row form when currencies are the same ---
@@ -1381,6 +1446,7 @@ frappe.ui.form.on("Cheque Table Receive", "cheque_currency", function(frm, cdt, 
     if (row.cheque_currency) {
         frappe.model.set_value(cdt, cdn, "account_currency", row.cheque_currency);
         update_target_exchange_rate(frm, row, 'cheque_table', true);
+        update_amount_in_usd(frm, locals[cdt][cdn], 'cheque_table');
     }
 });
 frappe.ui.form.on("Cheque Table Pay", "cheque_currency", function(frm, cdt, cdn) {
@@ -1389,6 +1455,7 @@ frappe.ui.form.on("Cheque Table Pay", "cheque_currency", function(frm, cdt, cdn)
     if (row.cheque_currency) {
         frappe.model.set_value(cdt, cdn, "account_currency_from", row.cheque_currency);
         update_target_exchange_rate(frm, row, 'cheque_table_2', true);
+        update_amount_in_usd(frm, locals[cdt][cdn], 'cheque_table_2');
     }
 });
 
@@ -1399,6 +1466,7 @@ frappe.ui.form.on("Multiple Cheque Entry", "posting_date", function(frm) {
             if (!row._rate_manually_set) {
                 update_target_exchange_rate(frm, row, 'cheque_table', false);
             }
+            update_amount_in_usd(frm, row, 'cheque_table');
         });
     }
     if (frm.fields_dict.cheque_table_2) {
@@ -1406,6 +1474,7 @@ frappe.ui.form.on("Multiple Cheque Entry", "posting_date", function(frm) {
             if (!row._rate_manually_set) {
                 update_target_exchange_rate(frm, row, 'cheque_table_2', false);
             }
+            update_amount_in_usd(frm, row, 'cheque_table_2');
         });
     }
 });
