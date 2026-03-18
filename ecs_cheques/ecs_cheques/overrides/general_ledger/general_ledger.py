@@ -631,7 +631,7 @@ def _fix_account_currency_per_row(data):
 				"paid_from", "paid_to",
 				"paid_from_account_currency", "paid_to_account_currency",
 				"received_amount", "paid_amount",
-				"target_exchange_rate",
+				"source_exchange_rate", "target_exchange_rate",
 			],
 		)
 		for pe in pe_rows:
@@ -648,8 +648,13 @@ def _fix_account_currency_per_row(data):
 
 			pe_payment_info[pe.name] = {
 				"payment_currency": pay_cur,
+				"paid_from": pe.paid_from or "",
+				"paid_to": pe.paid_to or "",
+				"paid_from_account_currency": pe.paid_from_account_currency or "",
+				"paid_to_account_currency": pe.paid_to_account_currency or "",
 				"received_amount": flt(pe.received_amount or 0),
 				"paid_amount": flt(pe.paid_amount or 0),
+				"source_exchange_rate": flt(pe.source_exchange_rate or 0),
 				"target_exchange_rate": flt(pe.target_exchange_rate or 0),
 			}
 
@@ -679,30 +684,59 @@ def _fix_account_currency_per_row(data):
 				row["account_currency"] = account_currency_map[account]
 
 			if payment_currency:
-				# Phase 3: override transaction_currency to payment currency
-				# (JOD) for BOTH sides so "Add Columns in Transaction Currency"
-				# displays a uniform payment-currency view.
-				row["transaction_currency"] = payment_currency
-
-				# Restate debit_in_account_currency / credit_in_account_currency
-				# in payment currency (JOD) so the standard ERPNext column
-				# formatter renders the correct amount and currency symbol.
-				received = info.get("received_amount", 0.0)
-				target_rate = info.get("target_exchange_rate", 0.0)
+				# Phase 3: set transaction_currency and account-currency amounts
+				# per side so that each GL row displays the amount in its own
+				# originating currency.
+				#
+				# Golden Rule (Phase 4):
+				#   Bank / Cash (paid_to)  → received_amount + received_currency
+				#   Party (paid_from)      → paid_amount    + party_currency
+				#
+				# This ensures the report shows, e.g.:
+				#   Bank row:  1,000 JOD  (received_amount in paid_to currency)
+				#   Party row: 3,000 ILS  (paid_amount in paid_from currency)
+				paid_from = info.get("paid_from", "")
+				paid_to = info.get("paid_to", "")
 				debit_company = flt(row.get("debit") or 0)
 				credit_company = flt(row.get("credit") or 0)
 				base = debit_company or credit_company
 
-				if not received and base and target_rate:
-					received = flt(base / target_rate, 9)
+				if account == paid_to:
+					# Bank / Cash side: source of truth = received_amount
+					tx_currency = info.get("paid_to_account_currency") or payment_currency
+					tx_amount = info.get("received_amount", 0.0)
+					if not tx_amount and base:
+						target_rate = info.get("target_exchange_rate", 0.0)
+						if target_rate:
+							tx_amount = flt(base / target_rate, 9)
+				elif account == paid_from:
+					# Party side: source of truth = paid_amount
+					tx_currency = info.get("paid_from_account_currency") or ""
+					tx_amount = info.get("paid_amount", 0.0)
+					if not tx_amount and base:
+						source_rate = info.get("source_exchange_rate", 0.0)
+						if source_rate:
+							tx_amount = flt(base / source_rate, 9)
+				else:
+					# Other PE-linked rows: fall back to payment currency /
+					# received_amount (legacy behaviour).
+					tx_currency = payment_currency
+					tx_amount = info.get("received_amount", 0.0)
+					if not tx_amount and base:
+						target_rate = info.get("target_exchange_rate", 0.0)
+						if target_rate:
+							tx_amount = flt(base / target_rate, 9)
 
-				if received:
+				if tx_currency:
+					row["transaction_currency"] = tx_currency
+
+				if tx_amount:
 					if debit_company:
-						row["debit_in_account_currency"] = received
+						row["debit_in_account_currency"] = tx_amount
 						row["credit_in_account_currency"] = 0.0
 					elif credit_company:
 						row["debit_in_account_currency"] = 0.0
-						row["credit_in_account_currency"] = received
+						row["credit_in_account_currency"] = tx_amount
 			continue
 
 		# Fall back to Account master currency for all other rows.
