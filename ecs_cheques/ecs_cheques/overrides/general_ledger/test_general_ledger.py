@@ -585,6 +585,7 @@ class TestFixAccountCurrencyPhase3(unittest.TestCase):
                     paid_to_account_currency="JOD",
                     received_amount=100.0,
                     paid_amount=500.0,
+                    source_exchange_rate=0.2818,  # ILS → USD
                     target_exchange_rate=1.41,
                 )]
             return []
@@ -597,12 +598,12 @@ class TestFixAccountCurrencyPhase3(unittest.TestCase):
         self._setup_and_run(bank_row, party_row)
         self.assertEqual(bank_row.get("transaction_currency"), "JOD")
 
-    def test_party_row_transaction_currency_overridden_to_jod(self):
-        """Phase 3 key requirement: party row transaction_currency = JOD (not ILS)."""
+    def test_party_row_transaction_currency_is_party_currency(self):
+        """Phase 3 fix: party row transaction_currency = ILS (party currency), NOT JOD."""
         bank_row = _make_row(account="Bank - JOD", debit=141.0, credit=0.0)
         party_row = _make_row(account="Customer AR - ILS", debit=0.0, credit=141.0)
         self._setup_and_run(bank_row, party_row)
-        self.assertEqual(party_row.get("transaction_currency"), "JOD")
+        self.assertEqual(party_row.get("transaction_currency"), "ILS")
 
     def test_party_row_account_currency_remains_ils(self):
         """account_currency must still reflect the true Account master currency."""
@@ -611,13 +612,21 @@ class TestFixAccountCurrencyPhase3(unittest.TestCase):
         self._setup_and_run(bank_row, party_row)
         self.assertEqual(party_row.get("account_currency"), "ILS")
 
-    def test_party_row_credit_in_account_currency_is_jod_amount(self):
-        """credit_in_account_currency restated to JOD so the standard column shows JOD."""
+    def test_party_row_credit_in_account_currency_is_paid_amount(self):
+        """Phase 3 fix: credit_in_account_currency for party row = paid_amount (ILS)."""
         bank_row = _make_row(account="Bank - JOD", debit=141.0, credit=0.0)
         party_row = _make_row(account="Customer AR - ILS", debit=0.0, credit=141.0)
         self._setup_and_run(bank_row, party_row)
-        # received_amount = 100.0 JOD → credit_in_account_currency should be 100.0
-        self.assertAlmostEqual(party_row.get("credit_in_account_currency"), 100.0, places=3)
+        # paid_amount = 500.0 ILS → credit_in_account_currency should be 500.0
+        self.assertAlmostEqual(party_row.get("credit_in_account_currency"), 500.0, places=3)
+
+    def test_bank_row_debit_in_account_currency_is_received_amount(self):
+        """Phase 3 fix: debit_in_account_currency for bank row = received_amount (JOD)."""
+        bank_row = _make_row(account="Bank - JOD", debit=141.0, credit=0.0)
+        party_row = _make_row(account="Customer AR - ILS", debit=0.0, credit=141.0)
+        self._setup_and_run(bank_row, party_row)
+        # received_amount = 100.0 JOD → debit_in_account_currency should be 100.0
+        self.assertAlmostEqual(bank_row.get("debit_in_account_currency"), 100.0, places=3)
 
     def test_non_pe_row_uses_account_master_currency(self):
         row = _make_row(

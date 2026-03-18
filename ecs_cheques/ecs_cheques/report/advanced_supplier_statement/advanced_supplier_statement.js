@@ -121,26 +121,24 @@ function _inject_statement_css() {
     if (document.getElementById("ecs-statement-css")) return;
 
     var css = [
-        /* ── Table header ─────────────────────────────────────────── */
-        ".report-wrapper .datatable .dt-header .dt-cell__content {",
-        "    background-color: #f0f4f7;",
-        "    color: #333;",
-        "    font-weight: 600;",
-        "    font-size: 12px;",
-        "    border-bottom: 2px solid #c8d8e4;",
+        /* ── Alternating row background ───────────────────────────── */
+        ".report-wrapper .datatable .dt-row:nth-child(even) .dt-cell {",
+        "    background-color: #f4f9ff;",
         "}",
 
         /* ── General row styling ──────────────────────────────────── */
         ".report-wrapper .datatable .dt-row .dt-cell {",
-        "    color: #333;",
-        "    font-size: 12px;",
-        "    border-bottom: 1px solid #e8eef2;",
-        "    padding: 6px 8px;",
+        "    color: #000000;",
+        "    font-size: 13px;",
+        "    border-bottom: 1px solid #7ecbff;",
+        "    padding: 0px 0px;",
         "}",
 
-        /* ── Alternating row background ───────────────────────────── */
-        ".report-wrapper .datatable .dt-row:nth-child(even) .dt-cell {",
-        "    background-color: #f8fbfd;",
+        /* ── Table header ─────────────────────────────────────────── */
+        ".report-wrapper .datatable .dt-header .dt-cell {",
+        "    background-color: #7ecbff;",
+        "    color: white;",
+        "    font-weight: bold;",
         "}",
 
         /* ── Opening / Closing row highlight ──────────────────────── */
