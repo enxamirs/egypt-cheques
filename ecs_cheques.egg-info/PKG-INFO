@@ -1,11 +1,7 @@
 Metadata-Version: 2.4
 Name: ecs_cheques
-Version: 0.0.1
+Version: 0.0.0
 Summary: Custom App For Cheques
-Author: erpcloud.systems
-Author-email: info@erpcloud.systems
+Requires-Python: >=3.10
 License-File: LICENSE
-Dynamic: author
-Dynamic: author-email
 Dynamic: license-file
-Dynamic: summary
