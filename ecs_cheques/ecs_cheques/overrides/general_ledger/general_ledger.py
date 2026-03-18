@@ -579,20 +579,16 @@ def _fix_account_currency_per_row(data):
 
 	ERPNext's GL report may omit ``account_currency`` or set it to the filter
 	presentation currency for all rows.  This function fills in the correct
-	per-row currency using two sources:
+	per-row currency by reading each account's currency from the Account master
+	(batch-fetched for performance).
 
-	1. **Payment Entry rows** – Phase 3 override: ``transaction_currency``
-	   and the in-memory ``debit_in_account_currency`` /
-	   ``credit_in_account_currency`` are set to the **payment currency**
-	   (e.g. JOD) for ALL GL rows of the PE, including the party row.
-	   This ensures that when "Add Columns in Transaction Currency" is
-	   enabled the standard columns display a uniform JOD view instead of
-	   mixing ILS (party side) and JOD (bank side).
-	   The original ``account_currency`` (ILS for the party account) is
-	   preserved separately so the account master information is not lost.
-
-	2. **All other rows** – the ``account_currency`` is read from the
-	   ``Account`` master (batch-fetched for performance).
+	GL Entry.transaction_currency is set to the account's own currency so that
+	the standard ERPNext "Add Columns in Transaction Currency" columns display
+	the correct per-account amount and symbol (e.g. 3000 ILS for the customer
+	row and 1000 JOD for the bank row).  debit_in_account_currency and
+	credit_in_account_currency are NOT overridden – ERPNext populates these
+	correctly from the GL Entry at submission time and they match the account
+	currency (ILS for party accounts, JOD for bank/cash accounts).
 	"""
 	if not data:
 		return
@@ -609,55 +605,6 @@ def _fix_account_currency_per_row(data):
 	)
 	account_currency_map = {r.name: r.account_currency for r in account_rows if r.account_currency}
 
-	# Batch-fetch Payment Entry currencies and amounts for GL rows that come
-	# from Payment Entries.
-	# Map: (pe_name, account_name) → account_currency
-	pe_account_currency_map = {}
-	# Map: pe_name → (payment_currency, received_amount, paid_amount, target_exchange_rate)
-	pe_payment_info = {}
-	pe_names = {
-		row.get("voucher_no")
-		for row in data
-		if isinstance(row, dict)
-		and row.get("voucher_type") == "Payment Entry"
-		and row.get("voucher_no")
-	}
-	if pe_names:
-		pe_rows = frappe.get_all(
-			"Payment Entry",
-			filters={"name": ["in", list(pe_names)]},
-			fields=[
-				"name",
-				"paid_from", "paid_to",
-				"paid_from_account_currency", "paid_to_account_currency",
-				"received_amount", "paid_amount",
-				"source_exchange_rate", "target_exchange_rate",
-			],
-		)
-		for pe in pe_rows:
-			if pe.paid_from and pe.paid_from_account_currency:
-				pe_account_currency_map[(pe.name, pe.paid_from)] = pe.paid_from_account_currency
-			if pe.paid_to and pe.paid_to_account_currency:
-				pe_account_currency_map[(pe.name, pe.paid_to)] = pe.paid_to_account_currency
-
-			# Determine the payment currency (Phase 3).
-			pay_cur = pe.paid_to_account_currency or pe.paid_from_account_currency or ""
-			if pe.paid_from_account_currency and pe.paid_to_account_currency:
-				if pe.paid_from_account_currency != pe.paid_to_account_currency:
-					pay_cur = pe.paid_to_account_currency  # bank / MOP side
-
-			pe_payment_info[pe.name] = {
-				"payment_currency": pay_cur,
-				"paid_from": pe.paid_from or "",
-				"paid_to": pe.paid_to or "",
-				"paid_from_account_currency": pe.paid_from_account_currency or "",
-				"paid_to_account_currency": pe.paid_to_account_currency or "",
-				"received_amount": flt(pe.received_amount or 0),
-				"paid_amount": flt(pe.paid_amount or 0),
-				"source_exchange_rate": flt(pe.source_exchange_rate or 0),
-				"target_exchange_rate": flt(pe.target_exchange_rate or 0),
-			}
-
 	for row in data:
 		if not isinstance(row, dict):
 			continue
@@ -665,86 +612,10 @@ def _fix_account_currency_per_row(data):
 		if not account:
 			continue
 
-		# For Payment Entry rows apply Phase 3: force transaction_currency to
-		# the payment currency (JOD) for ALL GL rows of the PE and update the
-		# in-memory account-currency amounts accordingly.
-		if row.get("voucher_type") == "Payment Entry" and row.get("voucher_no"):
-			pe_name = row["voucher_no"]
-			info = pe_payment_info.get(pe_name, {})
-			payment_currency = info.get("payment_currency", "")
-
-			# Keep the original account_currency from the Account master (or
-			# PE field) so downstream code that needs the real currency can
-			# still access it.  We only override transaction_currency for the
-			# report display layer.
-			pe_currency = pe_account_currency_map.get((pe_name, account))
-			if pe_currency:
-				row["account_currency"] = pe_currency
-			elif account_currency_map.get(account):
-				row["account_currency"] = account_currency_map[account]
-
-			if payment_currency:
-				# Phase 3: set transaction_currency and account-currency amounts
-				# per side so that each GL row displays the amount in its own
-				# originating currency.
-				#
-				# Golden Rule (Phase 4):
-				#   Bank / Cash (paid_to)  → received_amount + received_currency
-				#   Party (paid_from)      → paid_amount    + party_currency
-				#
-				# This ensures the report shows, e.g.:
-				#   Bank row:  1,000 JOD  (received_amount in paid_to currency)
-				#   Party row: 3,000 ILS  (paid_amount in paid_from currency)
-				paid_from = info.get("paid_from", "")
-				paid_to = info.get("paid_to", "")
-				debit_company = flt(row.get("debit") or 0)
-				credit_company = flt(row.get("credit") or 0)
-				base = debit_company or credit_company
-
-				if account == paid_to:
-					# Bank / Cash side: source of truth = received_amount
-					tx_currency = info.get("paid_to_account_currency") or payment_currency
-					tx_amount = info.get("received_amount", 0.0)
-					if not tx_amount and base:
-						target_rate = info.get("target_exchange_rate", 0.0)
-						if target_rate:
-							tx_amount = flt(base / target_rate, 9)
-				elif account == paid_from:
-					# Party side: source of truth = paid_amount
-					tx_currency = info.get("paid_from_account_currency") or ""
-					tx_amount = info.get("paid_amount", 0.0)
-					if not tx_amount and base:
-						source_rate = info.get("source_exchange_rate", 0.0)
-						if source_rate:
-							tx_amount = flt(base / source_rate, 9)
-				else:
-					# Other PE-linked rows: fall back to payment currency /
-					# received_amount (legacy behaviour).
-					tx_currency = payment_currency
-					tx_amount = info.get("received_amount", 0.0)
-					if not tx_amount and base:
-						target_rate = info.get("target_exchange_rate", 0.0)
-						if target_rate:
-							tx_amount = flt(base / target_rate, 9)
-
-				if tx_currency:
-					row["transaction_currency"] = tx_currency
-
-				if tx_amount:
-					if debit_company:
-						row["debit_in_account_currency"] = tx_amount
-						row["credit_in_account_currency"] = 0.0
-					elif credit_company:
-						row["debit_in_account_currency"] = 0.0
-						row["credit_in_account_currency"] = tx_amount
-			continue
-
-		# Fall back to Account master currency for all other rows.
-		if account_currency_map.get(account):
-			currency = account_currency_map[account]
+		currency = account_currency_map.get(account)
+		if currency:
 			row["account_currency"] = currency
-			# Always keep transaction_currency in sync with account_currency so
-			# the "Add Columns in Transaction Currency" columns display the
-			# correct symbol even when the GL report pre-populated the field
-			# with a different (e.g. company) currency.
+			# Keep transaction_currency in sync with account_currency so the
+			# standard "Add Columns in Transaction Currency" columns display the
+			# correct per-row symbol matching ERPNext default behaviour.
 			row["transaction_currency"] = currency

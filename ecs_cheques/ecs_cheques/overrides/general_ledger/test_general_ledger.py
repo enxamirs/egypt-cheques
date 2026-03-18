@@ -562,12 +562,18 @@ class TestMultipleChequeReference(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 – _fix_account_currency_per_row override
+# _fix_account_currency_per_row – simplified behaviour (ERPNext default)
 # ---------------------------------------------------------------------------
 
 class TestFixAccountCurrencyPhase3(unittest.TestCase):
-    """Phase 3: transaction_currency and account-currency amounts overridden
-    to payment currency (JOD) for ALL GL rows of a Payment Entry."""
+    """_fix_account_currency_per_row sets account_currency and
+    transaction_currency from the Account master for every GL row.
+
+    debit_in_account_currency and credit_in_account_currency are NOT
+    overridden so that ERPNext default behaviour is preserved:
+      * ILS account rows show 3000 ILS (the natural GL value)
+      * JOD account rows show 1000 JOD (the natural GL value)
+    """
 
     def _setup_and_run(self, bank_row, party_row):
         def _get_all(doctype, filters=None, fields=None, **kw):
@@ -576,18 +582,6 @@ class TestFixAccountCurrencyPhase3(unittest.TestCase):
                     _Dict(name="Bank - JOD", account_currency="JOD"),
                     _Dict(name="Customer AR - ILS", account_currency="ILS"),
                 ]
-            if doctype == "Payment Entry":
-                return [_Dict(
-                    name="PE-001",
-                    paid_from="Customer AR - ILS",
-                    paid_to="Bank - JOD",
-                    paid_from_account_currency="ILS",
-                    paid_to_account_currency="JOD",
-                    received_amount=100.0,
-                    paid_amount=500.0,
-                    source_exchange_rate=0.2818,  # ILS → USD
-                    target_exchange_rate=1.41,
-                )]
             return []
         frappe.get_all = MagicMock(side_effect=_get_all)
         _fix_account_currency_per_row([bank_row, party_row])
@@ -599,34 +593,28 @@ class TestFixAccountCurrencyPhase3(unittest.TestCase):
         self.assertEqual(bank_row.get("transaction_currency"), "JOD")
 
     def test_party_row_transaction_currency_is_party_currency(self):
-        """Phase 3 fix: party row transaction_currency = ILS (party currency), NOT JOD."""
+        """Party row transaction_currency = ILS (account master currency)."""
         bank_row = _make_row(account="Bank - JOD", debit=141.0, credit=0.0)
         party_row = _make_row(account="Customer AR - ILS", debit=0.0, credit=141.0)
         self._setup_and_run(bank_row, party_row)
         self.assertEqual(party_row.get("transaction_currency"), "ILS")
 
     def test_party_row_account_currency_remains_ils(self):
-        """account_currency must still reflect the true Account master currency."""
+        """account_currency must reflect the true Account master currency."""
         bank_row = _make_row(account="Bank - JOD", debit=141.0, credit=0.0)
         party_row = _make_row(account="Customer AR - ILS", debit=0.0, credit=141.0)
         self._setup_and_run(bank_row, party_row)
         self.assertEqual(party_row.get("account_currency"), "ILS")
 
-    def test_party_row_credit_in_account_currency_is_paid_amount(self):
-        """Phase 3 fix: credit_in_account_currency for party row = paid_amount (ILS)."""
+    def test_debit_in_account_currency_not_modified(self):
+        """debit_in_account_currency is NOT overridden – ERPNext provides it."""
         bank_row = _make_row(account="Bank - JOD", debit=141.0, credit=0.0)
         party_row = _make_row(account="Customer AR - ILS", debit=0.0, credit=141.0)
         self._setup_and_run(bank_row, party_row)
-        # paid_amount = 500.0 ILS → credit_in_account_currency should be 500.0
-        self.assertAlmostEqual(party_row.get("credit_in_account_currency"), 500.0, places=3)
-
-    def test_bank_row_debit_in_account_currency_is_received_amount(self):
-        """Phase 3 fix: debit_in_account_currency for bank row = received_amount (JOD)."""
-        bank_row = _make_row(account="Bank - JOD", debit=141.0, credit=0.0)
-        party_row = _make_row(account="Customer AR - ILS", debit=0.0, credit=141.0)
-        self._setup_and_run(bank_row, party_row)
-        # received_amount = 100.0 JOD → debit_in_account_currency should be 100.0
-        self.assertAlmostEqual(bank_row.get("debit_in_account_currency"), 100.0, places=3)
+        # The function must not add these keys; ERPNext GL entry already
+        # stores the correct account-currency amounts.
+        self.assertNotIn("debit_in_account_currency", bank_row)
+        self.assertNotIn("credit_in_account_currency", party_row)
 
     def test_non_pe_row_uses_account_master_currency(self):
         row = _make_row(
