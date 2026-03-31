@@ -426,6 +426,59 @@ class TestGetChequePaidAmount(unittest.TestCase):
         # Legacy path: 1000 × 1.410437 = 1410.437
         self.assertAlmostEqual(result, 1410.437, places=2)
 
+    def test_rate_drift_syncs_cheque_table_and_uses_pe_rate(self):
+        """Rate-drift scenario from the issue: ILS→JOD, company USD.
+
+        Exact numbers from the problem statement:
+          Paid Amount (ILS): 2173.73
+          source_exchange_rate (PE): 0.324427881   (ILS → USD)
+          Target Amount (JOD): 500.00
+          target_exchange_rate (PE): 1.410437235   (JOD → USD)
+          exchange_rate_party_to_mop (cheque table): 0.230019368  (stale)
+          Expected base: 2173.73 × 0.324427881 ≈ 705.219 USD
+
+        The cheque was originally received at a different rate
+        (exchange_rate_party_to_mop = 0.230019368) but the current Payment
+        Entry uses 0.324427881.  Both sides of the PE balance to 705.219 USD,
+        so submission must succeed.
+
+        Expected behaviour:
+        1. No exception is raised.
+        2. The returned base amount equals paid_amount × source_exchange_rate.
+        3. frappe.db.set_value is called to sync exchange_rate_party_to_mop.
+        """
+        ctr = _mock_cheque_table(
+            paid_amount=2173.73,
+            target_exchange_rate=1.410437235,
+            exchange_rate_party_to_mop=0.230019368,   # stale stored rate
+            account_currency_from="ILS",
+            account_currency="JOD",
+        )
+        doc = _make_doc(
+            cheque_table_no="966m7hk2o0",
+            paid_amount=2173.73,
+            source_exchange_rate=0.324427881,
+            target_exchange_rate=1.410437235,
+            paid_from_account_currency="ILS",
+            paid_to_account_currency="JOD",
+        )
+        with patch.object(frappe.db, "get_value", return_value=ctr), \
+             patch.object(frappe.db, "set_value") as mock_set_value:
+            # Must NOT raise
+            result = _get_cheque_paid_amount(doc, "USD")
+
+        # 1. Returned base amount uses PE source_exchange_rate
+        expected_base = flt(2173.73 * 0.324427881, 9)
+        self.assertAlmostEqual(result, expected_base, places=4)
+
+        # 2. The stale cheque-table rate was synchronised to the PE rate
+        mock_set_value.assert_called_once_with(
+            "Cheque Table Receive",
+            "966m7hk2o0",
+            "exchange_rate_party_to_mop",
+            0.324427881,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for JE account balance using _je_account
