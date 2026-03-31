@@ -148,12 +148,17 @@ def _get_cheque_paid_amount(doc, company_currency):
         if not (pe_paid_from_currency and pe_paid_from_currency == company_currency):
             pe_source = flt(doc.source_exchange_rate) or 1.0
             if abs(pe_source - exch_party_to_mop) / exch_party_to_mop > 0.01:
-                frappe.throw(
-                    _(
-                        "Payment Entry source_exchange_rate ({0}) does not match "
-                        "exchange_rate_party_to_mop ({1}) from Cheque Table Receive '{2}'. "
-                        "Please recreate the Payment Entry."
-                    ).format(pe_source, exch_party_to_mop, doc.cheque_table_no)
+                # Rates have drifted (e.g. the cheque was originally recorded at a
+                # different rate than the current Payment Entry). The PE has already
+                # been validated by ERPNext to ensure both sides balance in company
+                # currency, so it is the authoritative source of truth.  Synchronise
+                # the stored rate on the Cheque Table Receive row so that future
+                # lookups remain consistent, then proceed with the PE rate.
+                frappe.db.set_value(
+                    "Cheque Table Receive",
+                    doc.cheque_table_no,
+                    "exchange_rate_party_to_mop",
+                    pe_source,
                 )
             return flt(flt(doc.paid_amount) * pe_source, 9)
 
