@@ -598,6 +598,152 @@ class TestJeAccountBalance(unittest.TestCase):
             entry["credit_in_account_currency"], expected_usd, places=2
         )
 
+    # ------------------------------------------------------------------
+    # Tri-currency scenarios: party=ILS, MOP=JOD, company=USD
+    # ------------------------------------------------------------------
+
+    def test_tri_currency_paid_to_uses_received_amount(self):
+        """Bug PAY-2026-00057: JOD account must use received_amount, not paid_amount.
+
+        Scenario:
+          company = USD
+          paid_from_account_currency = ILS  (party account)
+          paid_to_account_currency   = JOD  (cheque wallet)
+          paid_amount                = 4,500 ILS
+          received_amount            = 1,000 JOD
+          base_paid_amount           = 1,400 USD
+
+        Without the fix, the JOD account would incorrectly show 4,500 JOD
+        (derived from exchange-rate division) instead of 1,000 JOD.
+        With amount_in_account_currency=received_amount, it must show 1,000 JOD.
+        """
+        paid_amount_company = 1400.0  # USD
+
+        doc = _make_doc(
+            paid_amount=4500.0,
+            source_exchange_rate=1400.0 / 4500.0,  # ILS → USD ≈ 0.3111
+            target_exchange_rate=1.4,               # JOD → USD
+            paid_from_account_currency="ILS",
+            paid_to_account_currency="JOD",
+        )
+        doc.received_amount = 1000.0
+
+        currency_map = {"jod_wallet": "JOD"}
+        with self._patch_account_currency(currency_map):
+            entry = _je_account(
+                "jod_wallet", paid_amount_company, True, doc, "USD",
+                amount_in_account_currency=flt(doc.received_amount),
+            )
+
+        # debit_in_account_currency must be 1,000 JOD (received_amount)
+        self.assertAlmostEqual(
+            entry["debit_in_account_currency"], 1000.0, places=2,
+            msg="JOD account must use received_amount (1000), not paid_amount (4500)",
+        )
+        # debit (company currency) must be 1,400 USD
+        self.assertAlmostEqual(entry["debit"], 1400.0, places=2)
+        # exchange_rate = 1400 / 1000 = 1.4  (JOD → USD)
+        self.assertAlmostEqual(entry["exchange_rate"], 1.4, places=4)
+
+    def test_tri_currency_paid_from_uses_paid_amount(self):
+        """Counterpart of paid_to test: ILS account must use paid_amount."""
+        paid_amount_company = 1400.0
+
+        doc = _make_doc(
+            paid_amount=4500.0,
+            source_exchange_rate=1400.0 / 4500.0,
+            target_exchange_rate=1.4,
+            paid_from_account_currency="ILS",
+            paid_to_account_currency="JOD",
+        )
+
+        currency_map = {"ils_party": "ILS"}
+        with self._patch_account_currency(currency_map):
+            entry = _je_account(
+                "ils_party", paid_amount_company, False, doc, "USD",
+                amount_in_account_currency=flt(doc.paid_amount),
+            )
+
+        # credit_in_account_currency must be 4,500 ILS (paid_amount)
+        self.assertAlmostEqual(
+            entry["credit_in_account_currency"], 4500.0, places=2,
+            msg="ILS account must use paid_amount (4500)",
+        )
+        # credit (company currency) must be 1,400 USD
+        self.assertAlmostEqual(entry["credit"], 1400.0, places=2)
+        # exchange_rate = 1400 / 4500 ≈ 0.3111  (ILS → USD)
+        self.assertAlmostEqual(entry["exchange_rate"], 1400.0 / 4500.0, places=4)
+
+    def test_tri_currency_je_balance(self):
+        """Both sides of a tri-currency JE must balance in company currency."""
+        paid_amount_company = 1400.0
+
+        doc = _make_doc(
+            paid_amount=4500.0,
+            source_exchange_rate=1400.0 / 4500.0,
+            target_exchange_rate=1.4,
+            paid_from_account_currency="ILS",
+            paid_to_account_currency="JOD",
+        )
+        doc.received_amount = 1000.0
+
+        currency_map = {"ils_party": "ILS", "jod_wallet": "JOD"}
+        with self._patch_account_currency(currency_map):
+            debit_entry = _je_account(
+                "jod_wallet", paid_amount_company, True, doc, "USD",
+                amount_in_account_currency=flt(doc.received_amount),
+            )
+            credit_entry = _je_account(
+                "ils_party", paid_amount_company, False, doc, "USD",
+                amount_in_account_currency=flt(doc.paid_amount),
+            )
+
+        total_debit, total_credit = self._total_debit_credit([debit_entry, credit_entry])
+        self.assertAlmostEqual(
+            total_debit, total_credit, places=2,
+            msg="Tri-currency JE imbalance: debit={}, credit={}".format(
+                total_debit, total_credit
+            ),
+        )
+
+    def test_amount_in_account_currency_ignored_for_company_currency_account(self):
+        """When account currency == company currency, amount_in_account_currency is ignored."""
+        paid_amount_company = 1400.0
+        doc = _make_doc(
+            paid_amount=4500.0,
+            source_exchange_rate=1400.0 / 4500.0,
+            target_exchange_rate=1.4,
+            paid_from_account_currency="ILS",
+            paid_to_account_currency="JOD",
+        )
+
+        currency_map = {"usd_acc": "USD"}
+        with self._patch_account_currency(currency_map):
+            entry = _je_account(
+                "usd_acc", paid_amount_company, True, doc, "USD",
+                amount_in_account_currency=9999.0,  # should be ignored
+            )
+
+        # Company currency account: amount_in_acc = amount_company, exchange_rate = 1
+        self.assertAlmostEqual(entry["debit_in_account_currency"], 1400.0, places=2)
+        self.assertAlmostEqual(entry["exchange_rate"], 1.0, places=2)
+
+    def test_no_amount_in_account_currency_falls_back_to_exchange_rate(self):
+        """Without amount_in_account_currency, _je_account uses exchange-rate derivation."""
+        paid_amount_company = 1400.0
+        doc = _make_doc(
+            target_exchange_rate=1.4,
+            paid_to_account_currency="JOD",
+            paid_from_account_currency="ILS",
+        )
+
+        currency_map = {"jod_wallet": "JOD"}
+        with self._patch_account_currency(currency_map):
+            entry = _je_account("jod_wallet", paid_amount_company, True, doc, "USD")
+
+        # Fallback: 1400 / 1.4 = 1000 JOD
+        self.assertAlmostEqual(entry["debit_in_account_currency"], 1000.0, places=2)
+
 
 # ---------------------------------------------------------------------------
 # Tests for _needs_multi_currency
